@@ -28,6 +28,9 @@ This fork tracks upstream and only diverges where noted below.
 - Minimal hand-rolled parsing of the launch flags (`src/main.rs`):
   `-c/--config <path>`, `--session`, commands after `--`. Anything else is
   ignored with a warning.
+- Renamed user-facing identity to niri-lite: binary (`Cargo.toml`), config
+  directory `~/.config/niri-lite` (`src/main.rs`), desktop, session, service,
+  portal files (`resources/`), IPC socket filename (`src/ipc/server.rs`).
 
 ## Development
 

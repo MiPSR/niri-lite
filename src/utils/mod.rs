@@ -575,7 +575,7 @@ pub fn show_screenshot_notification(image_path: Option<&Path>) -> anyhow::Result
         Some("org.freedesktop.Notifications"),
         "Notify",
         &(
-            "niri",
+            "niri-lite",
             0u32,
             image_url.as_ref().map(|url| url.as_str()).unwrap_or(""),
             "Screenshot captured",

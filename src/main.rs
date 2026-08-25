@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Set the current desktop for xdg-desktop-portal.
-        env::set_var("XDG_CURRENT_DESKTOP", "niri");
+        env::set_var("XDG_CURRENT_DESKTOP", "niri-lite");
         // Ensure the session type is set to Wayland for xdg-autostart and Qt apps.
         env::set_var("XDG_SESSION_TYPE", "wayland");
     }
@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // below, because some of those Drop impls themselves create Tracy spans.
     let _shutdown_tracy = ShutdownTracy;
 
-    info!("starting version {}", &version());
+    info!("starting niri-lite version {}", &version());
 
     // Load the config.
     let config_path = config_path(cli_config);
@@ -325,7 +325,7 @@ fn env_config_path() -> Option<PathBuf> {
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    let Some(dirs) = ProjectDirs::from("", "", "niri") else {
+    let Some(dirs) = ProjectDirs::from("", "", "niri-lite") else {
         warn!("error retrieving home directory");
         return None;
     };

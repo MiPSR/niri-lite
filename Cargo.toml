@@ -50,6 +50,10 @@ rust-version.workspace = true
 readme = "README.md"
 keywords = ["wayland", "compositor", "tiling", "smithay", "wm"]
 
+[[bin]]
+name = "niri-lite"
+path = "src/main.rs"
+
 [dependencies]
 accesskit = { version = "0.24", optional = true }
 accesskit_unix = { version = "0.22", optional = true }

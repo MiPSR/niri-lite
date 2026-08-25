@@ -36,7 +36,7 @@
         }:
 
         rustPlatform.buildRustPackage {
-          pname = "niri";
+          pname = "niri-lite";
           version = revision;
 
           src = lib.fileset.toSource {
@@ -53,9 +53,9 @@
           };
 
           postPatch = ''
-            patchShebangs resources/niri-session
+            patchShebangs resources/niri-lite-session
             substituteInPlace resources/niri.service \
-              --replace-fail 'ExecStart=niri' "ExecStart=$out/bin/niri"
+              --replace-fail 'ExecStart=niri-lite' "ExecStart=$out/bin/niri-lite"
           '';
 
           cargoLock = {
@@ -114,18 +114,12 @@
 
           postInstall =
             ''
-              installShellCompletion --cmd niri \
-                --bash <($out/bin/niri completions bash) \
-                --fish <($out/bin/niri completions fish) \
-                --nushell <($out/bin/niri completions nushell) \
-                --zsh <($out/bin/niri completions zsh)
-
-              install -Dm644 resources/niri.desktop -t $out/share/wayland-sessions
-              install -Dm644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal
+              install -Dm644 resources/niri-lite.desktop -t $out/share/wayland-sessions
+              install -Dm644 resources/niri-lite-portals.conf -t $out/share/xdg-desktop-portal
             ''
             + lib.optionalString withSystemd ''
-              install -Dm755 resources/niri-session $out/bin/niri-session
-              install -Dm644 resources/niri{.service,-shutdown.target} -t $out/lib/systemd/user
+              install -Dm755 resources/niri-lite-session $out/bin/niri-lite-session
+              install -Dm644 resources/niri-lite{.service,-shutdown.target} -t $out/lib/systemd/user
             '';
 
           env = {
@@ -143,14 +137,14 @@
           };
 
           passthru = {
-            providedSessions = [ "niri" ];
+            providedSessions = [ "niri-lite" ];
           };
 
           meta = {
             description = "Scrollable-tiling Wayland compositor";
             homepage = "https://github.com/niri-wm/niri";
             license = lib.licenses.gpl3Only;
-            mainProgram = "niri";
+            mainProgram = "niri-lite";
             platforms = lib.platforms.linux;
           };
         };

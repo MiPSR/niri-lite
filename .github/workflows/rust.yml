@@ -1,0 +1,53 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl gcc clang pkg-config meson ninja-build hwdata \
+            libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev \
+            libinput-dev libdbus-1-dev libsystemd-dev libseat-dev \
+            libpipewire-0.3-dev libpango1.0-dev libcairo2-dev \
+            libgdk-pixbuf-2.0-dev libadwaita-1-dev
+
+      - name: Build libdisplay-info 0.3.0 (same as Nixpkgs)
+        run: |
+          git clone --depth 1 --branch 0.3.0 \
+            https://gitlab.freedesktop.org/emersion/libdisplay-info.git /tmp/ldi
+          cd /tmp/ldi
+          meson setup build --prefix=/usr -Ddefault_library=both
+          ninja -C build && sudo ninja -C build install && sudo ldconfig
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --exclude niri-visual-tests
+
+      - name: Verify lite binary
+        run: test -x target/debug/niri-lite
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: niri-lite
+          path: target/debug/niri-lite
