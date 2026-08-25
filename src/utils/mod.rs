@@ -592,13 +592,6 @@ pub fn show_screenshot_notification(image_path: Option<&Path>) -> anyhow::Result
     Ok(())
 }
 
-#[inline(never)]
-pub fn cause_panic() {
-    let a = Duration::from_secs(1);
-    let b = Duration::from_secs(2);
-    let _ = a - b;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

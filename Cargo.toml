@@ -61,9 +61,6 @@ atomic = "0.6.1"
 bitflags.workspace = true
 bytemuck = { version = "1.25.2", features = ["derive"] }
 calloop = { version = "0.14.4", features = ["executor", "futures-io", "signals"] }
-clap = { workspace = true, features = ["string"] }
-clap_complete = "4.6.9"
-clap_complete_nushell = "4.6.1"
 directories = "6.0.0"
 drm-ffi = "0.9.1"
 fastrand = "2.5.0"
@@ -76,7 +73,7 @@ libc = "0.2.189"
 libdisplay-info = "0.3.0"
 log = { version = "0.4.33", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "26.4.0", path = "niri-config" }
-niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
+niri-ipc = { version = "26.4.0", path = "niri-ipc" }
 ordered-float = "5.3.0"
 pango = { version = "0.21.5", features = ["v1_44"] }
 pangocairo = "0.21.5"

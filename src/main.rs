@@ -3,6 +3,7 @@ extern crate tracing;
 
 use std::fmt::Write as _;
 use std::fs::File;
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
@@ -11,20 +12,15 @@ use std::sync::atomic::Ordering;
 use std::{env, mem};
 
 use calloop::EventLoop;
-use clap::{CommandFactory, Parser};
-use clap_complete::Shell;
-use clap_complete_nushell::Nushell;
 use directories::ProjectDirs;
-use niri::cli::{Cli, CompletionShell, Sub};
 #[cfg(feature = "dbus")]
 use niri::dbus;
-use niri::ipc::client::handle_msg;
 use niri::niri::State;
 use niri::utils::spawning::{
     spawn, spawn_sh, store_and_increase_nofile_rlimit, CHILD_DISPLAY, CHILD_ENV,
     REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
 };
-use niri::utils::{cause_panic, version, watcher, xwayland, IS_SYSTEMD_SERVICE};
+use niri::utils::{version, watcher, xwayland, IS_SYSTEMD_SERVICE};
 use niri_config::{Config, ConfigPath};
 use niri_ipc::socket::SOCKET_PATH_ENV;
 use sd_notify::NotifyState;
@@ -68,9 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let cli = Cli::parse();
+    let (cli_config, cli_session, cli_command) = parse_args();
 
-    if cli.session {
+    if cli_session {
         // If we're starting as a session, assume that the intention is to start on a TTY unless
         // this is a WSL environment. Remove DISPLAY, WAYLAND_DISPLAY or WAYLAND_SOCKET from our
         // environment if they are set, since they will cause the winit backend to be selected
@@ -96,46 +92,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("XDG_SESSION_TYPE", "wayland");
     }
 
-    // Handle subcommands.
-    if let Some(subcommand) = cli.subcommand {
-        match subcommand {
-            Sub::Validate { config } => {
-                tracy_client::Client::start();
-
-                config_path(config).load().config?;
-                info!("config is valid");
-                return Ok(());
-            }
-            Sub::Msg { msg, json } => {
-                handle_msg(msg, json)?;
-                return Ok(());
-            }
-            Sub::Panic => cause_panic(),
-            Sub::Completions { shell } => {
-                match shell {
-                    CompletionShell::Nushell => {
-                        clap_complete::generate(
-                            Nushell,
-                            &mut Cli::command(),
-                            "niri",
-                            &mut io::stdout(),
-                        );
-                    }
-                    other => {
-                        let generator = Shell::try_from(other).unwrap();
-                        clap_complete::generate(
-                            generator,
-                            &mut Cli::command(),
-                            "niri",
-                            &mut io::stdout(),
-                        );
-                    }
-                }
-                return Ok(());
-            }
-        }
-    }
-
     // Needs to be done before starting Tracy, so that it applies to Tracy's threads.
     niri::utils::signals::block_early().unwrap();
 
@@ -151,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("starting version {}", &version());
 
     // Load the config.
-    let config_path = config_path(cli.config);
+    let config_path = config_path(cli_config);
     env::remove_var("NIRI_CONFIG");
     let (config_created_at, config_load_result) = config_path.load_or_create();
     let config_errored = config_load_result.config.is_err();
@@ -186,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         display,
         false,
         true,
-        cli.session,
+        cli_session,
     )
     .unwrap();
 
@@ -217,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::remove_var("DISPLAY");
     }
 
-    if cli.session {
+    if cli_session {
         // We're starting as a session. Import our variables.
         import_environment();
 
@@ -231,10 +187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(feature = "dbus")]
-    dbus::DBusServers::start(&mut state, cli.session);
+    dbus::DBusServers::start(&mut state, cli_session);
 
     #[cfg(feature = "dbus")]
-    if cli.session {
+    if cli_session {
         state.niri.a11y.start();
     }
 
@@ -253,7 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     watcher::setup(&mut state, &config_path, config_includes);
 
     // Spawn commands from cli and auto-start.
-    spawn(cli.command, None);
+    spawn(cli_command, None);
 
     for elem in spawn_at_startup {
         spawn(elem.command, None);
@@ -276,6 +232,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap();
 
     Ok(())
+}
+
+fn parse_args() -> (Option<PathBuf>, bool, Vec<OsString>) {
+    let mut config = None;
+    let mut session = false;
+    let mut command: Vec<OsString> = vec![];
+
+    let mut args = env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("-c") | Some("--config") => match args.next() {
+                Some(value) => config = Some(PathBuf::from(value)),
+                None => warn!("missing value for {arg:?}, ignoring"),
+            },
+            Some(value) => {
+                if let Some(path) = value.strip_prefix("--config=") {
+                    config = Some(PathBuf::from(path));
+                } else if let Some(path) = value.strip_prefix("-c") {
+                    config = Some(PathBuf::from(path));
+                } else if value == "--session" {
+                    session = true;
+                } else if value == "--" {
+                    command.extend(args);
+                    break;
+                } else {
+                    warn!("ignoring unknown argument {value:?}");
+                }
+            }
+            None => warn!("ignoring non-UTF-8 argument {arg:?}"),
+        }
+    }
+
+    (config, session, command)
 }
 
 fn import_environment() {
