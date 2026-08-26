@@ -1,7 +1,7 @@
 use niri_ipc::ColumnDisplay;
 
 use crate::appearance::{
-    BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, CornerRadius, ShadowRule,
+    BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, ShadowRule,
     TabIndicatorRule,
 };
 use crate::layout::DefaultPresetSize;
@@ -59,9 +59,7 @@ pub struct WindowRule {
     pub draw_border_with_background: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub opacity: Option<f32>,
-    #[knuffel(child)]
-    pub geometry_corner_radius: Option<CornerRadius>,
-    #[knuffel(child, unwrap(argument))]
+        #[knuffel(child, unwrap(argument))]
     pub clip_to_geometry: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub baba_is_float: Option<bool>,
@@ -88,8 +86,6 @@ pub struct WindowRule {
 pub struct PopupsRule {
     #[knuffel(child, unwrap(argument))]
     pub opacity: Option<f32>,
-    #[knuffel(child)]
-    pub geometry_corner_radius: Option<CornerRadius>,
     #[knuffel(child, default)]
     pub background_effect: BackgroundEffectRule,
 }
@@ -100,8 +96,6 @@ pub struct ResolvedPopupsRules {
     /// Extra opacity to draw popups with.
     pub opacity: Option<f32>,
 
-    /// Corner radius to assume the popups have.
-    pub geometry_corner_radius: Option<CornerRadius>,
 
     /// Background effect configuration for popups.
     pub background_effect: BackgroundEffect,
@@ -111,9 +105,6 @@ impl MergeWith<PopupsRule> for ResolvedPopupsRules {
     fn merge_with(&mut self, part: &PopupsRule) {
         if let Some(x) = part.opacity {
             self.opacity = Some(x);
-        }
-        if let Some(x) = part.geometry_corner_radius {
-            self.geometry_corner_radius = Some(x);
         }
         self.background_effect.merge_with(&part.background_effect);
     }

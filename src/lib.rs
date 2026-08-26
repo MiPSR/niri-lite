@@ -3,8 +3,8 @@ extern crate tracing;
 
 #[cfg(feature = "dbus")]
 pub mod a11y;
-pub mod animation;
 pub mod backend;
+pub mod clock;
 pub mod cursor;
 #[cfg(feature = "dbus")]
 pub mod dbus;

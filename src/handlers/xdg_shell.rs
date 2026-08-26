@@ -904,19 +904,10 @@ impl XdgShellHandler for State {
         self.niri
             .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
-        self.store_unmap_snapshot(&window, output.as_ref());
-
-        let transaction = Transaction::new();
-        let blocker = transaction.blocker();
-        self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .layout
-                .start_close_animation_for_window(renderer, &window, blocker);
-        });
-
         let active_window = self.niri.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);
 
+        let transaction = Transaction::new();
         self.niri.window_mru_ui.remove_window(id);
         self.niri.layout.remove_window(&window, transaction.clone());
 
@@ -1496,7 +1487,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
         let span =
             trace_span!("toplevel pre-commit", surface = %surface.id(), serial = Empty).entered();
 
-        let Some((mapped, output)) = state.niri.layout.find_window_and_output_mut(surface) else {
+        let Some((mapped, _output)) = state.niri.layout.find_window_and_output_mut(surface) else {
             error!("pre-commit hook for mapped surfaces must be removed upon unmapping");
             return;
         };
@@ -1526,7 +1517,6 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
         });
 
         let mut transaction_for_dmabuf = None;
-        let mut animate = false;
         if let Some(serial) = commit_serial {
             if !span.is_disabled() {
                 span.record("serial", format!("{serial:?}"));
@@ -1565,8 +1555,6 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                     transaction_for_dmabuf = Some(transaction);
                 }
             }
-
-            animate = mapped.should_animate_commit(serial);
         } else if !got_unmapped {
             error!("commit on a mapped surface without a configured serial");
         };
@@ -1596,19 +1584,5 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             }
         }
 
-        let window = mapped.window.clone();
-        if got_unmapped {
-            let output = output.cloned();
-            state.store_unmap_snapshot(&window, output.as_ref());
-        } else {
-            if animate {
-                state.backend.with_primary_renderer(|renderer| {
-                    mapped.store_animation_snapshot(renderer);
-                });
-            }
-
-            // The toplevel remains mapped; clear any stored unmap snapshot.
-            state.niri.layout.clear_unmap_snapshot(&window);
-        }
     })
 }

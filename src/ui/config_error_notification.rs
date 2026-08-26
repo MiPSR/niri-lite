@@ -14,7 +14,7 @@ use smithay::output::Output;
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Point, Transform};
 
-use crate::animation::{Animation, Clock};
+use crate::clock::Clock;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -38,9 +38,7 @@ pub struct ConfigErrorNotification {
 
 enum State {
     Hidden,
-    Showing(Animation),
     Shown(Duration),
-    Hiding(Animation),
 }
 
 impl ConfigErrorNotification {
@@ -54,24 +52,13 @@ impl ConfigErrorNotification {
         }
     }
 
-    fn animation(&self, from: f64, to: f64) -> Animation {
-        let c = self.config.borrow();
-        Animation::new(
-            self.clock.clone(),
-            from,
-            to,
-            0.,
-            c.animations.config_notification_open_close.0,
-        )
-    }
-
     pub fn show_created(&mut self, created_path: &Path) {
         if self.created_path.as_deref() != Some(created_path) {
             self.created_path = Some(created_path.to_owned());
             self.buffers.borrow_mut().clear();
         }
 
-        self.state = State::Showing(self.animation(0., 1.));
+        self.state = State::Shown(self.display_duration());
     }
 
     pub fn show(&mut self) {
@@ -85,48 +72,33 @@ impl ConfigErrorNotification {
             self.buffers.borrow_mut().clear();
         }
 
-        // Show from scratch even if already showing to bring attention.
-        self.state = State::Showing(self.animation(0., 1.));
+        self.state = State::Shown(self.display_duration());
     }
 
     pub fn hide(&mut self) {
-        if matches!(self.state, State::Hidden) {
-            return;
-        }
-
-        self.state = State::Hiding(self.animation(1., 0.));
+        self.state = State::Hidden;
     }
 
-    pub fn advance_animations(&mut self) {
-        match &mut self.state {
-            State::Hidden => (),
-            State::Showing(anim) => {
-                if anim.is_done() {
-                    let duration = if self.created_path.is_some() {
-                        // Make this quite a bit longer because it comes with a monitor modeset
-                        // (can take a while) and an important hotkeys popup diverting the
-                        // attention.
-                        Duration::from_secs(8)
-                    } else {
-                        Duration::from_secs(4)
-                    };
-                    self.state = State::Shown(self.clock.now_unadjusted() + duration);
-                }
-            }
-            State::Shown(deadline) => {
-                if self.clock.now_unadjusted() >= *deadline {
-                    self.hide();
-                }
-            }
-            State::Hiding(anim) => {
-                if anim.is_clamped_done() {
-                    self.state = State::Hidden;
-                }
+    fn display_duration(&self) -> Duration {
+        if self.created_path.is_some() {
+            // Make this quite a bit longer because it comes with a monitor modeset
+            // (can take a while) and an important hotkeys popup diverting the
+            // attention.
+            Duration::from_secs(8)
+        } else {
+            Duration::from_secs(4)
+        }
+    }
+
+    pub fn update(&mut self) {
+        if let State::Shown(deadline) = &self.state {
+            if self.clock.now_unadjusted() >= *deadline {
+                self.hide();
             }
         }
     }
 
-    pub fn are_animations_ongoing(&self) -> bool {
+    pub fn needs_update(&self) -> bool {
         !matches!(self.state, State::Hidden)
     }
 
@@ -150,14 +122,9 @@ impl ConfigErrorNotification {
         let buffer = buffer.clone()?;
 
         let size = buffer.logical_size();
-        let y_range = size.h + f64::from(PADDING) * 2.;
 
         let x = (output_size.w - size.w).max(0.) / 2.;
-        let y = match &self.state {
-            State::Hidden => unreachable!(),
-            State::Showing(anim) | State::Hiding(anim) => -size.h + anim.value() * y_range,
-            State::Shown(_) => f64::from(PADDING) * 2.,
-        };
+        let y = f64::from(PADDING) * 2.;
 
         let location = Point::from((x, y));
         let location = location.to_physical_precise_round(scale).to_logical(scale);

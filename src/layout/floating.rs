@@ -5,23 +5,20 @@ use std::rc::Rc;
 use niri_config::utils::MergeWith as _;
 use niri_config::{PresetSize, RelativeTo};
 use niri_ipc::{PositionChange, SizeChange, WindowLayout};
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size};
 
-use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
-use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::tile::Tile;
+use super::tile::TileRenderElement;
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
 };
-use crate::animation::{Animation, Clock};
-use crate::layout::RenderLayer;
+use crate::clock::Clock;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
-use crate::utils::transaction::TransactionBlocker;
 use crate::utils::{
     center_preferring_top_left_in_area, clamp_preferring_top_left_in_area, ensure_min_max_size,
     ensure_min_max_size_maybe_zero, ResizeEdge,
@@ -51,9 +48,6 @@ pub struct FloatingSpace<W: LayoutElement> {
     /// Ongoing interactive resize.
     interactive_resize: Option<InteractiveResize<W>>,
 
-    /// Windows in the closing animation.
-    closing_windows: Vec<ClosingWindow>,
-
     /// View size for this space.
     view_size: Size<f64, Logical>,
 
@@ -64,6 +58,7 @@ pub struct FloatingSpace<W: LayoutElement> {
     scale: f64,
 
     /// Clock for driving animations.
+    #[cfg_attr(not(test), allow(dead_code))]
     clock: Clock,
 
     /// Configurable properties of the layout.
@@ -73,7 +68,6 @@ pub struct FloatingSpace<W: LayoutElement> {
 niri_render_elements! {
     FloatingSpaceRenderElement<R> => {
         Tile = TileRenderElement<R>,
-        ClosingWindow = ClosingWindowRenderElement,
     }
 }
 
@@ -213,7 +207,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
             data: Vec::new(),
             active_window_id: None,
             interactive_resize: None,
-            closing_windows: Vec::new(),
             view_size,
             working_area,
             scale,
@@ -247,43 +240,18 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
-    pub fn advance_animations(&mut self) {
-        for tile in &mut self.tiles {
-            tile.advance_animations();
-        }
-
-        self.closing_windows.retain_mut(|closing| {
-            closing.advance_animations();
-            closing.are_animations_ongoing()
-        });
+    pub fn needs_update(&self) -> bool {
+        self.tiles.iter().any(Tile::needs_update)
     }
 
-    pub fn are_animations_ongoing(&self) -> bool {
-        self.tiles.iter().any(Tile::are_animations_ongoing) || !self.closing_windows.is_empty()
-    }
-
-    pub fn are_transitions_ongoing(&self) -> bool {
-        self.tiles.iter().any(Tile::are_transitions_ongoing) || !self.closing_windows.is_empty()
-    }
-
-    pub fn update_render_elements(
-        &mut self,
-        is_active: bool,
-        view_rect: Rectangle<f64, Logical>,
-        layer: RenderLayer,
-    ) {
+    pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
         let active = self.active_window_id.clone();
         for (tile, offset) in self.tiles_with_offsets_mut() {
-            // Skip tiles belonging to a different render layer.
-            if layer.is_normal() == tile.is_moving_between_workspaces() {
-                continue;
-            }
-
             let id = tile.window().id();
             let is_active = is_active && Some(id) == active.as_ref();
 
             let mut tile_view_rect = view_rect;
-            tile_view_rect.loc -= offset + tile.render_offset();
+            tile_view_rect.loc -= offset;
             tile.update_render_elements(is_active, tile_view_rect);
         }
     }
@@ -551,26 +519,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        id: &W::Id,
-        blocker: TransactionBlocker,
-    ) {
-        let (tile, tile_pos) = self
-            .tiles_with_render_positions_mut(false)
-            .find(|(tile, _)| tile.window().id() == id)
-            .unwrap();
-
-        let Some(snapshot) = tile.take_unmap_snapshot() else {
-            return;
-        };
-
-        let tile_size = tile.tile_size();
-
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
-    }
-
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
         if !self.contains(id) {
             return false;
@@ -599,42 +547,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let data = self.data.remove(from_idx);
         self.tiles.insert(to_idx, tile);
         self.data.insert(to_idx, data);
-    }
-
-    pub fn start_close_animation_for_tile(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        snapshot: TileRenderSnapshot,
-        tile_size: Size<f64, Logical>,
-        tile_pos: Point<f64, Logical>,
-        blocker: TransactionBlocker,
-    ) {
-        let anim = Animation::new(
-            self.clock.clone(),
-            0.,
-            1.,
-            0.,
-            self.options.animations.window_close.anim,
-        );
-
-        let blocker = if self.options.disable_transactions {
-            TransactionBlocker::completed()
-        } else {
-            blocker
-        };
-
-        let scale = Scale::from(self.scale);
-        let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
-        );
-        match res {
-            Ok(closing) => {
-                self.closing_windows.push(closing);
-            }
-            Err(err) => {
-                warn!("error creating a closing window animation: {err:?}");
-            }
-        }
     }
 
     pub fn toggle_window_width(&mut self, id: Option<&W::Id>, forwards: bool) {
@@ -687,15 +599,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles[idx].floating_preset_width_idx = Some(preset_idx);
 
         self.interactive_resize_end(Some(&id));
-    }
-
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
-        let Some(idx) = self.idx_of(id) else {
-            return false;
-        };
-
-        self.tiles[idx].start_open_animation();
-        true
     }
 
     pub fn toggle_window_height(&mut self, id: Option<&W::Id>, forwards: bool) {
@@ -925,12 +828,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
-    fn move_to(&mut self, idx: usize, new_pos: Point<f64, Logical>, animate: bool) {
-        if animate {
-            self.move_and_animate(idx, new_pos);
-        } else {
-            self.data[idx].set_logical_pos(new_pos);
-        }
+    fn move_to(&mut self, idx: usize, new_pos: Point<f64, Logical>, _animate: bool) {
+        self.data[idx].set_logical_pos(new_pos);
 
         self.interactive_resize_end(None);
     }
@@ -1069,30 +968,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
         &self,
         mut ctx: RenderCtx<R>,
         xray_pos: XrayPos,
-        view_rect: Rectangle<f64, Logical>,
         focus_ring: bool,
-        layer: RenderLayer,
         push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
     ) {
-        let scale = Scale::from(self.scale);
-
-        // Draw the closing windows on top of the other windows.
-        //
-        // FIXME: I guess this should rather preserve the stacking order when the window is closed.
-        if layer.is_normal() {
-            for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), view_rect, scale);
-                push(elem.into());
-            }
-        }
-
         let active = self.active_window_id.clone();
         for (tile, tile_pos) in self.tiles_with_render_positions() {
-            // Skip tiles belonging to a different render layer.
-            if layer.is_normal() == tile.is_moving_between_workspaces() {
-                continue;
-            }
-
             // For the active tile, draw the focus ring.
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
 
@@ -1239,23 +1119,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn logical_to_size_frac(&self, logical_pos: Point<f64, Logical>) -> Point<f64, SizeFrac> {
         Data::logical_to_size_frac_in_working_area(self.working_area, logical_pos)
-    }
-
-    fn move_and_animate(&mut self, idx: usize, new_pos: Point<f64, Logical>) {
-        // Moves up to this logical pixel distance are not animated.
-        const ANIMATION_THRESHOLD_SQ: f64 = 10. * 10.;
-
-        let tile = &mut self.tiles[idx];
-        let data = &mut self.data[idx];
-
-        let prev_pos = data.logical_pos;
-        data.set_logical_pos(new_pos);
-        let new_pos = data.logical_pos;
-
-        let diff = prev_pos - new_pos;
-        if diff.x * diff.x + diff.y * diff.y > ANIMATION_THRESHOLD_SQ {
-            tile.animate_move_from(prev_pos - new_pos);
-        }
     }
 
     pub fn new_window_size(

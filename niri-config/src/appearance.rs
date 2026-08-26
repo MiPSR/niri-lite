@@ -140,94 +140,6 @@ pub enum HueInterpolation {
     Decreasing,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct CornerRadius {
-    pub top_left: f32,
-    pub top_right: f32,
-    pub bottom_right: f32,
-    pub bottom_left: f32,
-}
-
-impl From<CornerRadius> for [f32; 4] {
-    fn from(value: CornerRadius) -> Self {
-        [
-            value.top_left,
-            value.top_right,
-            value.bottom_right,
-            value.bottom_left,
-        ]
-    }
-}
-
-impl From<f32> for CornerRadius {
-    fn from(value: f32) -> Self {
-        Self {
-            top_left: value,
-            top_right: value,
-            bottom_right: value,
-            bottom_left: value,
-        }
-    }
-}
-
-impl CornerRadius {
-    pub fn fit_to(self, width: f32, height: f32) -> Self {
-        // Like in CSS: https://drafts.csswg.org/css-backgrounds/#corner-overlap
-        let reduction = f32::min(
-            f32::min(
-                width / (self.top_left + self.top_right),
-                width / (self.bottom_left + self.bottom_right),
-            ),
-            f32::min(
-                height / (self.top_left + self.bottom_left),
-                height / (self.top_right + self.bottom_right),
-            ),
-        );
-        let reduction = f32::min(1., reduction);
-
-        Self {
-            top_left: self.top_left * reduction,
-            top_right: self.top_right * reduction,
-            bottom_right: self.bottom_right * reduction,
-            bottom_left: self.bottom_left * reduction,
-        }
-    }
-
-    pub fn expanded_by(mut self, width: f32) -> Self {
-        // Radius = 0 is preserved, so that square corners remain square.
-        if self.top_left > 0. {
-            self.top_left += width;
-        }
-        if self.top_right > 0. {
-            self.top_right += width;
-        }
-        if self.bottom_right > 0. {
-            self.bottom_right += width;
-        }
-        if self.bottom_left > 0. {
-            self.bottom_left += width;
-        }
-
-        if width < 0. {
-            self.top_left = self.top_left.max(0.);
-            self.top_right = self.top_right.max(0.);
-            self.bottom_left = self.bottom_left.max(0.);
-            self.bottom_right = self.bottom_right.max(0.);
-        }
-
-        self
-    }
-
-    pub fn scaled_by(self, scale: f32) -> Self {
-        Self {
-            top_left: self.top_left * scale,
-            top_right: self.top_right * scale,
-            bottom_right: self.bottom_right * scale,
-            bottom_left: self.bottom_left * scale,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FocusRing {
     pub off: bool,
@@ -465,7 +377,6 @@ pub struct TabIndicator {
     pub length: TabIndicatorLength,
     pub position: TabIndicatorPosition,
     pub gaps_between_tabs: f64,
-    pub corner_radius: f64,
     pub active_color: Option<Color>,
     pub inactive_color: Option<Color>,
     pub urgent_color: Option<Color>,
@@ -487,7 +398,7 @@ impl Default for TabIndicator {
             },
             position: TabIndicatorPosition::Left,
             gaps_between_tabs: 0.,
-            corner_radius: 0.,
+
             active_color: None,
             inactive_color: None,
             urgent_color: None,
@@ -512,7 +423,6 @@ impl MergeWith<TabIndicatorPart> for TabIndicator {
             gap,
             width,
             gaps_between_tabs,
-            corner_radius,
         );
 
         merge_clone!((self, part), length, position);
@@ -546,8 +456,6 @@ pub struct TabIndicatorPart {
     pub position: Option<TabIndicatorPosition>,
     #[knuffel(child, unwrap(argument))]
     pub gaps_between_tabs: Option<FloatOrInt<0, 65535>>,
-    #[knuffel(child, unwrap(argument))]
-    pub corner_radius: Option<FloatOrInt<0, 65535>>,
     #[knuffel(child)]
     pub active_color: Option<Color>,
     #[knuffel(child)]
@@ -887,124 +795,6 @@ where
     }
 }
 
-impl<S> knuffel::Decode<S> for CornerRadius
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        // Check for unexpected type name.
-        if let Some(type_name) = &node.type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-
-        let decode_radius = |ctx: &mut knuffel::decode::Context<S>,
-                             val: &knuffel::ast::Value<S>| {
-            // Check for unexpected type name.
-            if let Some(typ) = &val.type_name {
-                ctx.emit_error(DecodeError::TypeName {
-                    span: typ.span().clone(),
-                    found: Some((**typ).clone()),
-                    expected: knuffel::errors::ExpectedType::no_type(),
-                    rust_type: "str",
-                });
-            }
-
-            // Decode both integers and floats.
-            let radius = match *val.literal {
-                knuffel::ast::Literal::Int(ref x) => f32::from(match x.try_into() {
-                    Ok(x) => x,
-                    Err(err) => {
-                        ctx.emit_error(DecodeError::conversion(&val.literal, err));
-                        0i16
-                    }
-                }),
-                knuffel::ast::Literal::Decimal(ref x) => match x.try_into() {
-                    Ok(x) => x,
-                    Err(err) => {
-                        ctx.emit_error(DecodeError::conversion(&val.literal, err));
-                        0.
-                    }
-                },
-                _ => {
-                    ctx.emit_error(DecodeError::scalar_kind(
-                        knuffel::decode::Kind::Int,
-                        &val.literal,
-                    ));
-                    0.
-                }
-            };
-
-            if radius < 0. {
-                ctx.emit_error(DecodeError::conversion(&val.literal, "radius must be >= 0"));
-            }
-
-            radius
-        };
-
-        // Get the first argument.
-        let mut iter_args = node.arguments.iter();
-        let val = iter_args
-            .next()
-            .ok_or_else(|| DecodeError::missing(node, "additional argument is required"))?;
-
-        let top_left = decode_radius(ctx, val);
-
-        let mut rv = CornerRadius {
-            top_left,
-            top_right: top_left,
-            bottom_right: top_left,
-            bottom_left: top_left,
-        };
-
-        if let Some(val) = iter_args.next() {
-            rv.top_right = decode_radius(ctx, val);
-
-            let val = iter_args.next().ok_or_else(|| {
-                DecodeError::missing(node, "either 1 or 4 arguments are required")
-            })?;
-            rv.bottom_right = decode_radius(ctx, val);
-
-            let val = iter_args.next().ok_or_else(|| {
-                DecodeError::missing(node, "either 1 or 4 arguments are required")
-            })?;
-            rv.bottom_left = decode_radius(ctx, val);
-
-            // Check for unexpected following arguments.
-            if let Some(val) = iter_args.next() {
-                ctx.emit_error(DecodeError::unexpected(
-                    &val.literal,
-                    "argument",
-                    "unexpected argument",
-                ));
-            }
-        }
-
-        // Check for unexpected properties and children.
-        for name in node.properties.keys() {
-            ctx.emit_error(DecodeError::unexpected(
-                name,
-                "property",
-                format!("unexpected property `{}`", name.escape_default()),
-            ));
-        }
-        for child in node.children.as_ref().map(|lst| &lst[..]).unwrap_or(&[]) {
-            ctx.emit_error(DecodeError::unexpected(
-                child,
-                "node",
-                format!("unexpected node `{}`", child.node_name.escape_default()),
-            ));
-        }
-
-        Ok(rv)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Blur {

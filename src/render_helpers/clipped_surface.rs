@@ -1,5 +1,4 @@
 use glam::{Mat3, Vec2};
-use niri_config::CornerRadius;
 use smithay::backend::renderer::buffer_y_inverted;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
@@ -8,7 +7,7 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
 use super::damage::ExtraDamage;
 use super::renderer::{AsGlesFrame as _, NiriRenderer};
@@ -19,7 +18,6 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
     program: GlesTexProgram,
-    corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
 }
@@ -27,7 +25,6 @@ pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
 #[derive(Debug, Default, Clone)]
 pub struct RoundedCornerDamage {
     damage: ExtraDamage,
-    corner_radius: CornerRadius,
 }
 
 impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
@@ -36,12 +33,10 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
         program: GlesTexProgram,
-        corner_radius: CornerRadius,
     ) -> Self {
         Self {
             inner: elem,
             program,
-            corner_radius,
             geometry,
             scale: scale.x as f32,
         }
@@ -94,7 +89,6 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         vec![
             Uniform::new("niri_scale", self.scale),
             Uniform::new("geo_size", geo_size),
-            Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
             mat3_uniform("input_to_geo", input_to_geo),
         ]
     }
@@ -107,50 +101,10 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         elem: &WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
-        corner_radius: CornerRadius,
     ) -> bool {
         let elem_geo = elem.geometry(scale);
         let geo = geometry.to_physical_precise_round(scale);
-
-        if corner_radius == CornerRadius::default() {
-            !geo.contains_rect(elem_geo)
-        } else {
-            let corners = Self::rounded_corners(geometry, corner_radius);
-            let corners = corners
-                .into_iter()
-                .map(|rect| rect.to_physical_precise_up(scale));
-            let geo = Rectangle::subtract_rects_many([geo], corners);
-            !Rectangle::subtract_rects_many([elem_geo], geo).is_empty()
-        }
-    }
-
-    fn rounded_corners(
-        geo: Rectangle<f64, Logical>,
-        corner_radius: CornerRadius,
-    ) -> [Rectangle<f64, Logical>; 4] {
-        let top_left = corner_radius.top_left as f64;
-        let top_right = corner_radius.top_right as f64;
-        let bottom_right = corner_radius.bottom_right as f64;
-        let bottom_left = corner_radius.bottom_left as f64;
-
-        [
-            Rectangle::new(geo.loc, Size::from((top_left, top_left))),
-            Rectangle::new(
-                Point::from((geo.loc.x + geo.size.w - top_right, geo.loc.y)),
-                Size::from((top_right, top_right)),
-            ),
-            Rectangle::new(
-                Point::from((
-                    geo.loc.x + geo.size.w - bottom_right,
-                    geo.loc.y + geo.size.h - bottom_right,
-                )),
-                Size::from((bottom_right, bottom_right)),
-            ),
-            Rectangle::new(
-                Point::from((geo.loc.x, geo.loc.y + geo.size.h - bottom_left)),
-                Size::from((bottom_left, bottom_left)),
-            ),
-        ]
+        !geo.contains_rect(elem_geo)
     }
 }
 
@@ -180,7 +134,6 @@ impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
         scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        // FIXME: radius changes need to cause damage.
         let damage = self.inner.damage_since(scale, commit);
 
         // Intersect with geometry, since we're clipping by it.
@@ -202,21 +155,7 @@ impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
             .into_iter()
             .filter_map(|rect| rect.intersection(geo));
 
-        // Subtract the rounded corners.
-        if self.corner_radius == CornerRadius::default() {
-            regions.collect()
-        } else {
-            let corners = Self::rounded_corners(self.geometry, self.corner_radius);
-
-            let elem_loc = self.geometry(scale).loc;
-            let corners = corners.into_iter().map(|rect| {
-                let mut rect = rect.to_physical_precise_up(scale);
-                rect.loc -= elem_loc;
-                rect
-            });
-
-            OpaqueRegions::from_slice(&Rectangle::subtract_rects_many(regions, corners))
-        }
+        OpaqueRegions::from_iter(regions)
     }
 
     fn alpha(&self) -> f32 {
@@ -290,16 +229,6 @@ impl<'render> RenderElement<TtyRenderer<'render>>
 }
 
 impl RoundedCornerDamage {
-    pub fn set_corner_radius(&mut self, corner_radius: CornerRadius) {
-        if self.corner_radius == corner_radius {
-            return;
-        }
-
-        // FIXME: make the damage granular.
-        self.corner_radius = corner_radius;
-        self.damage.damage_all();
-    }
-
     pub fn render(&self, geometry: Rectangle<f64, Logical>) -> ExtraDamage {
         self.damage.render(geometry)
     }

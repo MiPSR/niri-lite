@@ -7,24 +7,22 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{CenterFocusedColumn, PresetSize, Struts};
 use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
 use ordered_float::NotNan;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
-use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
-use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::tile::{Tile, TileRenderElement};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
-use crate::animation::{Animation, Clock};
+use crate::clock::Clock;
 use crate::input::swipe_tracker::SwipeTracker;
-use crate::layout::{RenderLayer, SizingMode};
+use crate::layout::SizingMode;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::utils::id::IdCounter;
-use crate::utils::transaction::{Transaction, TransactionBlocker};
+use crate::utils::transaction::Transaction;
 use crate::utils::ResizeEdge;
 use crate::window::ResolvedWindowRules;
 
@@ -68,9 +66,6 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// View offset to restore after unfullscreening or unmaximizing.
     view_offset_to_restore: Option<f64>,
 
-    /// Windows in the closing animation.
-    closing_windows: Vec<ClosingWindow>,
-
     /// View size for this space.
     view_size: Size<f64, Logical>,
 
@@ -98,7 +93,6 @@ pub struct ScrollingSpace<W: LayoutElement> {
 niri_render_elements! {
     ScrollingSpaceRenderElement<R> => {
         Tile = TileRenderElement<R>,
-        ClosingWindow = ClosingWindowRenderElement,
         TabIndicator = TabIndicatorRenderElement,
     }
 }
@@ -114,8 +108,6 @@ struct ColumnData {
 pub(super) enum ViewOffset {
     /// The view offset is static.
     Static(f64),
-    /// The view offset is animating.
-    Animation(Animation),
     /// The view offset is controlled by the ongoing gesture.
     Gesture(ViewGesture),
 }
@@ -123,10 +115,6 @@ pub(super) enum ViewOffset {
 #[derive(Debug)]
 pub(super) struct ViewGesture {
     current_view_offset: f64,
-    /// Animation for the extra offset to the current position.
-    ///
-    /// For example, when we need to activate a specific window during a DnD scroll.
-    animation: Option<Animation>,
     tracker: SwipeTracker,
     delta_from_tracker: f64,
     // The view offset we'll use if needed for activate_prev_column_on_removal.
@@ -212,12 +200,6 @@ pub struct Column<W: LayoutElement> {
     /// Tab indicator for the tabbed display mode.
     tab_indicator: TabIndicator,
 
-    /// Animation of the render offset during window swapping.
-    move_x_animation: Option<MoveAnimation>,
-
-    /// Animation of a column visually moving vertically.
-    move_y_animation: Option<MoveAnimation>,
-
     /// Latest known view size for this column's workspace.
     view_size: Size<f64, Logical>,
 
@@ -233,6 +215,7 @@ pub struct Column<W: LayoutElement> {
     scale: f64,
 
     /// Clock for driving animations.
+    #[cfg_attr(not(test), allow(dead_code))]
     clock: Clock,
 
     /// Configurable properties of the layout.
@@ -302,16 +285,6 @@ pub enum ScrollDirection {
     Right,
 }
 
-#[derive(Debug)]
-struct MoveAnimation {
-    anim: Animation,
-    from: f64,
-    /// Whether this animation is for moving the tile between workspaces.
-    ///
-    /// Controls whether the tile is rendered uncropped and above others.
-    is_between_workspaces: bool,
-}
-
 impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn new(
         view_size: Size<f64, Logical>,
@@ -330,7 +303,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             view_offset: ViewOffset::Static(0.),
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
-            closing_windows: Vec::new(),
             view_size,
             working_area,
             parent_area,
@@ -372,19 +344,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
-    pub fn advance_animations(&mut self) {
-        if let ViewOffset::Animation(anim) = &self.view_offset {
-            if anim.is_done() {
-                self.view_offset = ViewOffset::Static(anim.to());
-            }
-        }
-
+    pub fn update(&mut self) {
         if let ViewOffset::Gesture(gesture) = &mut self.view_offset {
             // Make sure the last event time doesn't go too much out of date (for
             // workspaces not under cursor), causing sudden jumps.
             //
-            // This happens after any dnd_scroll_gesture_scroll() calls (in
-            // Layout::advance_animations()), so it doesn't mess up the time delta there.
+            // This happens after any dnd_scroll_gesture_scroll() calls.
             if let Some(last_time) = &mut gesture.dnd_last_event_time {
                 let now = self.clock.now_unadjusted();
                 if *last_time != now {
@@ -396,49 +361,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     gesture.dnd_nonzero_start_time = None;
                 }
             }
-
-            if let Some(anim) = &mut gesture.animation {
-                if anim.is_done() {
-                    gesture.animation = None;
-                }
-            }
         }
-
-        for col in &mut self.columns {
-            col.advance_animations();
-        }
-
-        self.closing_windows.retain_mut(|closing| {
-            closing.advance_animations();
-            closing.are_animations_ongoing()
-        });
     }
 
-    pub fn are_animations_ongoing(&self) -> bool {
-        self.view_offset.is_animation_ongoing()
-            || self.columns.iter().any(Column::are_animations_ongoing)
-            || !self.closing_windows.is_empty()
+    pub fn needs_update(&self) -> bool {
+        self.columns.iter().any(Column::needs_update)
     }
 
-    pub fn are_transitions_ongoing(&self) -> bool {
-        !self.view_offset.is_static()
-            || self.columns.iter().any(Column::are_transitions_ongoing)
-            || !self.closing_windows.is_empty()
-    }
-
-    pub fn update_render_elements(&mut self, is_active: bool, layer: RenderLayer) {
+    pub fn update_render_elements(&mut self, is_active: bool) {
         let view_pos = Point::from((self.view_pos(), 0.));
         let view_size = self.view_size;
         let active_idx = self.active_column_idx;
         for (col_idx, (col, col_x)) in self.columns_mut().enumerate() {
-            // Skip columns belonging to a different render layer.
-            if layer.is_normal() == col.is_moving_between_workspaces() {
-                continue;
-            }
-
             let is_active = is_active && col_idx == active_idx;
             let col_off = Point::from((col_x, 0.));
-            let col_pos = view_pos - col_off - col.render_offset();
+            let col_pos = view_pos - col_off;
             let view_rect = Rectangle::new(col_pos, view_size);
             col.update_render_elements(is_active, view_rect);
         }
@@ -713,34 +650,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     fn animate_view_offset(&mut self, idx: usize, new_view_offset: f64) {
-        self.animate_view_offset_with_config(
-            idx,
-            new_view_offset,
-            self.options.animations.horizontal_view_movement.0,
-        );
+        self.animate_view_offset_with_config(idx, new_view_offset);
     }
 
-    fn animate_view_offset_with_config(
-        &mut self,
-        idx: usize,
-        new_view_offset: f64,
-        config: niri_config::Animation,
-    ) {
+    fn animate_view_offset_with_config(&mut self, idx: usize, new_view_offset: f64) {
         let new_col_x = self.column_x(idx);
         let old_col_x = self.column_x(self.active_column_idx);
         let offset_delta = old_col_x - new_col_x;
         self.view_offset.offset(offset_delta);
-
-        let pixel = 1. / self.scale;
-
-        // If our view offset is already this or animating towards this, we don't need to do
-        // anything.
-        let to_diff = new_view_offset - self.view_offset.target();
-        if to_diff.abs() < pixel {
-            // Correct for any inaccuracy.
-            self.view_offset.offset(to_diff);
-            return;
-        }
 
         match &mut self.view_offset {
             ViewOffset::Gesture(gesture) if gesture.dnd_last_event_time.is_some() => {
@@ -748,20 +665,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
                 let current_pos = gesture.current_view_offset - gesture.delta_from_tracker;
                 gesture.delta_from_tracker = new_view_offset - current_pos;
-                let offset_delta = new_view_offset - gesture.current_view_offset;
                 gesture.current_view_offset = new_view_offset;
-
-                gesture.animate_from(-offset_delta, self.clock.clone(), config);
             }
             _ => {
-                // FIXME: also compute and use current velocity.
-                self.view_offset = ViewOffset::Animation(Animation::new(
-                    self.clock.clone(),
-                    self.view_offset.current(),
-                    new_view_offset,
-                    0.,
-                    config,
-                ));
+                self.view_offset = ViewOffset::Static(new_view_offset);
             }
         }
     }
@@ -770,10 +677,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         &mut self,
         target_x: Option<f64>,
         idx: usize,
-        config: niri_config::Animation,
     ) {
         let new_view_offset = self.compute_new_view_offset_for_column_centered(target_x, idx);
-        self.animate_view_offset_with_config(idx, new_view_offset, config);
+        self.animate_view_offset_with_config(idx, new_view_offset);
     }
 
     fn animate_view_offset_to_column_with_config(
@@ -781,10 +687,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         target_x: Option<f64>,
         idx: usize,
         prev_idx: Option<usize>,
-        config: niri_config::Animation,
     ) {
         let new_view_offset = self.compute_new_view_offset_for_column(target_x, idx, prev_idx);
-        self.animate_view_offset_with_config(idx, new_view_offset, config);
+        self.animate_view_offset_with_config(idx, new_view_offset);
     }
 
     fn animate_view_offset_to_column(
@@ -793,24 +698,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         idx: usize,
         prev_idx: Option<usize>,
     ) {
-        self.animate_view_offset_to_column_with_config(
-            target_x,
-            idx,
-            prev_idx,
-            self.options.animations.horizontal_view_movement.0,
-        )
+        self.animate_view_offset_to_column_with_config(target_x, idx, prev_idx)
     }
 
     fn activate_column(&mut self, idx: usize) {
-        self.activate_column_with_anim_config(
-            idx,
-            self.options.animations.horizontal_view_movement.0,
-        );
-    }
-
-    fn activate_column_with_anim_config(&mut self, idx: usize, config: niri_config::Animation) {
         if self.active_column_idx == idx
-            // During a DnD scroll, animate even when activating the same window, for DnD hold.
+            // During a DnD scroll, re-align even when activating the same window, for DnD hold.
             && (self.columns.is_empty() || !self.view_offset.is_dnd_scroll())
         {
             return;
@@ -820,7 +713,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             None,
             idx,
             Some(self.active_column_idx),
-            config,
         );
 
         if self.active_column_idx != idx {
@@ -907,7 +799,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         activate: bool,
         width: ColumnWidth,
         is_full_width: bool,
-        anim: Option<niri_config::Animation>,
     ) {
         let column = Column::new_with_tile(
             tile,
@@ -919,7 +810,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             is_full_width,
         );
 
-        self.add_column(col_idx, column, activate, anim);
+        self.add_column(col_idx, column, activate);
     }
 
     pub fn add_tile_to_column(
@@ -929,50 +820,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         tile: Tile<W>,
         activate: bool,
     ) {
-        let prev_next_x = self.column_x(col_idx + 1);
-
         let target_column = &mut self.columns[col_idx];
         let tile_idx = tile_idx.unwrap_or(target_column.tiles.len());
-        let mut prev_active_tile_idx = target_column.active_tile_idx;
 
         target_column.add_tile_at(tile_idx, tile);
         self.data[col_idx].update(target_column);
 
-        if tile_idx <= prev_active_tile_idx {
+        if tile_idx <= target_column.active_tile_idx {
             target_column.active_tile_idx += 1;
-            prev_active_tile_idx += 1;
         }
 
         if activate {
             target_column.activate_idx(tile_idx);
             if self.active_column_idx != col_idx {
                 self.activate_column(col_idx);
-            }
-        }
-
-        let target_column = &mut self.columns[col_idx];
-        if target_column.display_mode == ColumnDisplay::Tabbed {
-            if target_column.active_tile_idx == tile_idx {
-                // Fade out the previously active tile.
-                let tile = &mut target_column.tiles[prev_active_tile_idx];
-                tile.animate_alpha(1., 0., self.options.animations.window_movement.0);
-            } else {
-                // Fade out when adding into a tabbed column into the background.
-                let tile = &mut target_column.tiles[tile_idx];
-                tile.animate_alpha(1., 0., self.options.animations.window_movement.0);
-            }
-        }
-
-        // Adding a wider window into a column increases its width now (even if the window will
-        // shrink later). Move the columns to account for this.
-        let offset = self.column_x(col_idx + 1) - prev_next_x;
-        if self.active_column_idx <= col_idx {
-            for col in &mut self.columns[col_idx + 1..] {
-                col.animate_move_x_from(-offset);
-            }
-        } else {
-            for col in &mut self.columns[..=col_idx] {
-                col.animate_move_x_from(offset);
             }
         }
     }
@@ -984,7 +845,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         activate: bool,
         width: ColumnWidth,
         is_full_width: bool,
-        anim: Option<niri_config::Animation>,
     ) {
         let right_of_idx = self
             .columns
@@ -993,7 +853,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .unwrap();
         let col_idx = right_of_idx + 1;
 
-        self.add_tile(Some(col_idx), tile, activate, width, is_full_width, anim);
+        self.add_tile(Some(col_idx), tile, activate, width, is_full_width);
     }
 
     pub fn add_column(
@@ -1001,7 +861,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         idx: Option<usize>,
         mut column: Column<W>,
         activate: bool,
-        anim_config: Option<niri_config::Animation>,
     ) {
         let was_empty = self.columns.is_empty();
 
@@ -1027,24 +886,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             self.active_column_idx += 1;
         }
 
-        // Animate movement of other columns.
-        let offset = self.column_x(idx + 1) - self.column_x(idx);
-        let config = anim_config.unwrap_or(self.options.animations.window_movement.0);
-        if self.active_column_idx <= idx {
-            for col in &mut self.columns[idx + 1..] {
-                col.animate_move_x_from_with_config(-offset, config);
-            }
-        } else {
-            for col in &mut self.columns[..idx] {
-                col.animate_move_x_from_with_config(offset, config);
-            }
-        }
-
         if activate {
             // If this is the first window on an empty workspace, remove the effect of whatever
-            // view_offset was left over and skip the animation.
+            // view_offset was left over.
             if was_empty {
-                self.view_offset = ViewOffset::Static(0.);
                 self.view_offset =
                     ViewOffset::Static(self.compute_new_view_offset_for_column(None, idx, None));
             }
@@ -1052,9 +897,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             let prev_offset = (!was_empty && idx == self.active_column_idx + 1)
                 .then(|| self.view_offset.stationary());
 
-            let anim_config =
-                anim_config.unwrap_or(self.options.animations.horizontal_view_movement.0);
-            self.activate_column_with_anim_config(idx, anim_config);
+            self.activate_column(idx);
             self.activate_prev_column_on_removal = prev_offset;
         }
     }
@@ -1068,7 +911,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let column = &self.columns[column_idx];
 
         let tile_idx = column.position(window).unwrap();
-        self.remove_tile_by_idx(column_idx, tile_idx, transaction, None)
+        self.remove_tile_by_idx(column_idx, tile_idx, transaction)
     }
 
     pub fn remove_tile_by_idx(
@@ -1076,11 +919,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         column_idx: usize,
         tile_idx: usize,
         transaction: Transaction,
-        anim_config: Option<niri_config::Animation>,
     ) -> RemovedTile<W> {
         // If this is the only tile in the column, remove the whole column.
         if self.columns[column_idx].tiles.len() == 1 {
-            let mut column = self.remove_column_by_idx(column_idx, anim_config);
+            let mut column = self.remove_column_by_idx(column_idx);
             return RemovedTile {
                 tile: column.tiles.remove(tile_idx),
                 width: column.width,
@@ -1090,23 +932,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         let column = &mut self.columns[column_idx];
-        let prev_width = self.data[column_idx].width;
-
-        let movement_config = anim_config.unwrap_or(self.options.animations.window_movement.0);
-
-        // Animate movement of other tiles.
-        // FIXME: tiles can move by X too, in a centered or resizing layout with one window smaller
-        // than the others.
-        let offset_y = column.tile_offset(tile_idx + 1).y - column.tile_offset(tile_idx).y;
-        for tile in &mut column.tiles[tile_idx + 1..] {
-            tile.animate_move_y_from(offset_y);
-        }
-
-        if column.display_mode == ColumnDisplay::Tabbed && tile_idx != column.active_tile_idx {
-            // Fade in when removing background tab from a tabbed column.
-            let tile = &mut column.tiles[tile_idx];
-            tile.animate_alpha(0., 1., movement_config);
-        }
 
         let was_normal = column.sizing_mode().is_normal();
 
@@ -1144,31 +969,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if tile_idx < column.active_tile_idx {
             // A tile above was removed; preserve the current position.
             column.active_tile_idx -= 1;
-        } else if tile_idx == column.active_tile_idx {
-            // The active tile was removed, so the active tile index shifted to the next tile.
-            if tile_idx == column.tiles.len() {
-                // The bottom tile was removed and it was active, update active idx to remain valid.
-                column.activate_idx(tile_idx - 1);
-            } else {
-                // Ensure the newly active tile animates to opaque.
-                column.tiles[tile_idx].ensure_alpha_animates_to_1();
-            }
+        } else if tile_idx == column.active_tile_idx && tile_idx == column.tiles.len() {
+            // The bottom tile was removed and it was active, update active idx to remain valid.
+            column.activate_idx(tile_idx - 1);
         }
 
         column.update_tile_sizes_with_transaction(true, transaction);
         self.data[column_idx].update(column);
-        let offset = prev_width - column.width();
-
-        // Animate movement of the other columns.
-        if self.active_column_idx <= column_idx {
-            for col in &mut self.columns[column_idx + 1..] {
-                col.animate_move_x_from_with_config(offset, movement_config);
-            }
-        } else {
-            for col in &mut self.columns[..=column_idx] {
-                col.animate_move_x_from_with_config(-offset, movement_config);
-            }
-        }
 
         tile
     }
@@ -1186,27 +993,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return None;
         }
 
-        Some(self.remove_column_by_idx(self.active_column_idx, None))
+        Some(self.remove_column_by_idx(self.active_column_idx))
     }
 
-    pub fn remove_column_by_idx(
-        &mut self,
-        column_idx: usize,
-        anim_config: Option<niri_config::Animation>,
-    ) -> Column<W> {
-        // Animate movement of the other columns.
-        let movement_config = anim_config.unwrap_or(self.options.animations.window_movement.0);
-        let offset = self.column_x(column_idx + 1) - self.column_x(column_idx);
-        if self.active_column_idx <= column_idx {
-            for col in &mut self.columns[column_idx + 1..] {
-                col.animate_move_x_from_with_config(offset, movement_config);
-            }
-        } else {
-            for col in &mut self.columns[..column_idx] {
-                col.animate_move_x_from_with_config(-offset, movement_config);
-            }
-        }
-
+    pub fn remove_column_by_idx(&mut self, column_idx: usize) -> Column<W> {
         let column = self.columns.remove(column_idx);
         self.data.remove(column_idx);
 
@@ -1235,8 +1025,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return column;
         }
 
-        let view_config = anim_config.unwrap_or(self.options.animations.horizontal_view_movement.0);
-
         if column_idx < self.active_column_idx {
             // A column to the left was removed; preserve the current position.
             // FIXME: preserve activate_prev_column_on_removal.
@@ -1249,27 +1037,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             if 0 < column_idx {
                 let prev_offset = self.activate_prev_column_on_removal.unwrap();
 
-                self.activate_column_with_anim_config(self.active_column_idx - 1, view_config);
+                self.activate_column(self.active_column_idx - 1);
 
                 // Restore the view offset but make sure to scroll the view in case the
                 // previous window had resized.
-                self.animate_view_offset_with_config(
-                    self.active_column_idx,
-                    prev_offset,
-                    view_config,
-                );
+                self.animate_view_offset_with_config(self.active_column_idx, prev_offset);
                 self.animate_view_offset_to_column_with_config(
                     None,
                     self.active_column_idx,
                     None,
-                    view_config,
                 );
             }
         } else {
-            self.activate_column_with_anim_config(
-                min(self.active_column_idx, self.columns.len() - 1),
-                view_config,
-            );
+            self.activate_column(min(self.active_column_idx, self.columns.len() - 1));
         }
 
         column
@@ -1283,9 +1063,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .find(|(_, col)| col.contains(window))
             .unwrap();
         let was_normal = column.sizing_mode().is_normal();
-        let prev_origin = column.tiles_origin();
 
-        let (tile_idx, tile) = column
+        let (_, tile) = column
             .tiles
             .iter_mut()
             .enumerate()
@@ -1306,64 +1085,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         column.update_tile_sizes(false);
 
         let offset = prev_width - self.data[col_idx].width;
-
-        // Move other columns in tandem with resizing.
-        let ongoing_resize_anim = column.tiles[tile_idx].resize_animation().is_some();
-        if offset != 0. {
-            if self.active_column_idx <= col_idx {
-                for col in &mut self.columns[col_idx + 1..] {
-                    // If there's a resize animation on the tile (that may have just started in
-                    // column.update_window()), then the apparent size change is smooth with no
-                    // sudden jumps. This corresponds to adding an X animation to adjacent columns.
-                    //
-                    // There could also be no resize animation with nonzero offset. This could
-                    // happen for example:
-                    // - if the window resized on its own, which we don't animate
-                    // - if the window resized by less than 10 px (the resize threshold)
-                    //
-                    // The latter case could also cancel an ongoing resize animation.
-                    //
-                    // Now, stationary columns shouldn't react to this offset change in any way,
-                    // i.e. their apparent X position should jump together with the resize.
-                    // However, adjacent columns that are already animating an X movement should
-                    // offset their animations to avoid the jump.
-                    //
-                    // Notably, this is necessary to fix the animation jump when resizing width back
-                    // and forth in quick succession (in a way that cancels the resize animation).
-                    if ongoing_resize_anim {
-                        col.animate_move_x_from_with_config(
-                            offset,
-                            self.options.animations.window_resize.anim,
-                        );
-                    } else {
-                        col.offset_move_anim_current(offset);
-                    }
-                }
-            } else {
-                for col in &mut self.columns[..=col_idx] {
-                    if ongoing_resize_anim {
-                        col.animate_move_x_from_with_config(
-                            -offset,
-                            self.options.animations.window_resize.anim,
-                        );
-                    } else {
-                        col.offset_move_anim_current(-offset);
-                    }
-                }
-            }
-        }
-
-        // When a column goes between fullscreen and non-fullscreen, the tiles origin can change.
-        // The change comes from things like ignoring struts and hiding the tab indicator in
-        // fullscreen, so both in X and Y directions.
-        let column = &mut self.columns[col_idx];
-        let new_origin = column.tiles_origin();
-        let origin_delta = prev_origin - new_origin;
-        if origin_delta != Point::new(0., 0.) {
-            for (tile, _pos) in column.tiles_mut() {
-                tile.animate_move_from(origin_delta);
-            }
-        }
 
         if col_idx == self.active_column_idx {
             // If offset == 0, then don't mess with the view or the gesture. Some clients (Firefox,
@@ -1404,7 +1125,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // In tabbed display mode, there can be multiple tiles in a fullscreen column. They
             // will unfullscreen one by one, and the column width will shrink only when the
             // last tile unfullscreens. This is when we want to restore the view offset,
-            // otherwise it will immediately reset back by the animate_view_offset below.
+            // otherwise it will immediately reset back by the view offset adjustment below.
             let unfullscreen_offset = if !was_normal && is_normal {
                 // Take the value unconditionally, even if the view is currently frozen by
                 // a view gesture. It shouldn't linger around because it's only valid for this
@@ -1417,22 +1138,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // We might need to move the view to ensure the resized window is still visible. But
             // only do it when the view isn't frozen by an interactive resize or a view gesture.
             if self.interactive_resize.is_none() && !self.view_offset.is_gesture() {
-                // Synchronize the horizontal view movement with the resize so that it looks nice.
-                // This is especially important for always-centered view.
-                let config = if ongoing_resize_anim {
-                    self.options.animations.window_resize.anim
-                } else {
-                    self.options.animations.horizontal_view_movement.0
-                };
-
                 // Restore the view offset upon unfullscreening if needed.
                 if let Some(prev_offset) = unfullscreen_offset {
-                    self.animate_view_offset_with_config(col_idx, prev_offset, config);
+                    self.animate_view_offset_with_config(col_idx, prev_offset);
                 }
 
-                // FIXME: we will want to skip the animation in some cases here to make continuously
-                // resizing windows not look janky.
-                self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
+                self.animate_view_offset_to_column_with_config(None, col_idx, None);
             }
         }
     }
@@ -1473,109 +1184,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.activate_column(column_idx);
 
         true
-    }
-
-    pub fn start_close_animation_for_window(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        window: &W::Id,
-        blocker: TransactionBlocker,
-    ) {
-        let (tile, mut tile_pos) = self
-            .tiles_with_render_positions_mut(false)
-            .find(|(tile, _)| tile.window().id() == window)
-            .unwrap();
-
-        let Some(snapshot) = tile.take_unmap_snapshot() else {
-            return;
-        };
-
-        let tile_size = tile.tile_size();
-
-        let (col_idx, tile_idx) = self
-            .columns
-            .iter()
-            .enumerate()
-            .find_map(|(col_idx, col)| {
-                col.tiles
-                    .iter()
-                    .position(|tile| tile.window().id() == window)
-                    .map(move |tile_idx| (col_idx, tile_idx))
-            })
-            .unwrap();
-
-        let col = &self.columns[col_idx];
-        let removing_last = col.tiles.len() == 1;
-
-        // Skip closing animation for invisible tiles in a tabbed column.
-        if col.display_mode == ColumnDisplay::Tabbed && tile_idx != col.active_tile_idx {
-            return;
-        }
-
-        tile_pos.x += self.view_pos();
-
-        if col_idx < self.active_column_idx {
-            let offset = if removing_last {
-                self.column_x(col_idx + 1) - self.column_x(col_idx)
-            } else {
-                self.data[col_idx].width
-                    - col
-                        .data
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, data)| {
-                            (idx != tile_idx).then_some(NotNan::new(data.size.w).unwrap())
-                        })
-                        .max()
-                        .map(NotNan::into_inner)
-                        .unwrap()
-            };
-            tile_pos.x -= offset;
-        }
-
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
-    }
-
-    fn start_close_animation_for_tile(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        snapshot: TileRenderSnapshot,
-        tile_size: Size<f64, Logical>,
-        tile_pos: Point<f64, Logical>,
-        blocker: TransactionBlocker,
-    ) {
-        let anim = Animation::new(
-            self.clock.clone(),
-            0.,
-            1.,
-            0.,
-            self.options.animations.window_close.anim,
-        );
-
-        let blocker = if self.options.disable_transactions {
-            TransactionBlocker::completed()
-        } else {
-            blocker
-        };
-
-        let scale = Scale::from(self.scale);
-        let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
-        );
-        match res {
-            Ok(closing) => {
-                self.closing_windows.push(closing);
-            }
-            Err(err) => {
-                warn!("error creating a closing window animation: {err:?}");
-            }
-        }
-    }
-
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
-        self.columns
-            .iter_mut()
-            .any(|col| col.start_open_animation(id))
     }
 
     pub fn focus_left(&mut self) -> bool {
@@ -1713,7 +1321,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         let current_col_x = self.column_x(self.active_column_idx);
-        let next_col_x = self.column_x(self.active_column_idx + 1);
 
         let mut column = self.columns.remove(self.active_column_idx);
         let data = self.data.remove(self.active_column_idx);
@@ -1725,23 +1332,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let view_offset_delta = -self.column_x(self.active_column_idx) + current_col_x;
         self.view_offset.offset(view_offset_delta);
 
-        // The column we just moved is offset by the difference between its new and old position.
-        let new_col_x = self.column_x(new_idx);
-        self.columns[new_idx].animate_move_x_from(current_col_x - new_col_x);
-
-        // All columns in between moved by the width of the column that we just moved.
-        let others_x_offset = next_col_x - current_col_x;
-        if self.active_column_idx < new_idx {
-            for col in &mut self.columns[self.active_column_idx..new_idx] {
-                col.animate_move_x_from(others_x_offset);
-            }
-        } else {
-            for col in &mut self.columns[new_idx + 1..=self.active_column_idx] {
-                col.animate_move_x_from(-others_x_offset);
-            }
-        }
-
-        self.activate_column_with_anim_config(new_idx, self.options.animations.window_movement.0);
+        self.activate_column(new_idx);
     }
 
     pub fn move_left(&mut self) -> bool {
@@ -1815,7 +1406,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         };
 
         let source_column = &self.columns[source_col_idx];
-        let prev_off = source_column.tile_offset(source_tile_idx);
 
         let source_tile_was_active = self.active_column_idx == source_col_idx
             && source_column.active_tile_idx == source_tile_idx;
@@ -1828,49 +1418,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // Move into adjacent column.
             let target_column_idx = source_col_idx - 1;
 
-            let offset = if self.active_column_idx <= source_col_idx {
-                // Tiles to the right animate from the following column.
-                self.column_x(source_col_idx) - self.column_x(target_column_idx)
-            } else {
-                // Tiles to the left animate to preserve their right edge position.
-                f64::max(
-                    0.,
-                    self.data[target_column_idx].width - self.data[source_col_idx].width,
-                )
-            };
-            let mut offset = Point::from((offset, 0.));
-
             if source_tile_was_active {
-                // Make sure the previous (target) column is activated so the animation looks right.
-                //
-                // However, if it was already going to be activated, leave the offset as is. This
-                // improves the workflow that has become common with tabbed columns: open a new
-                // window, then immediately consume it left as a new tab.
+                // Make sure the previous (target) column is activated so the window looks right.
                 self.activate_prev_column_on_removal
-                    .get_or_insert(self.view_offset.stationary() + offset.x);
+                    .get_or_insert(self.view_offset.stationary());
             }
 
-            offset += self.columns[source_col_idx].render_offset();
-            let RemovedTile { tile, .. } = self.remove_tile_by_idx(
-                source_col_idx,
-                0,
-                Transaction::new(),
-                Some(self.options.animations.window_movement.0),
-            );
+            let RemovedTile { tile, .. } =
+                self.remove_tile_by_idx(source_col_idx, 0, Transaction::new());
             self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active);
-
-            let target_column = &mut self.columns[target_column_idx];
-            offset -= target_column.render_offset();
-            offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
-
-            let new_tile = target_column.tiles.last_mut().unwrap();
-            new_tile.animate_move_from(offset);
         } else {
             // Move out of column.
-            let mut offset = source_column.render_offset();
-
-            let removed =
-                self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new(), None);
+            let removed = self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new());
 
             // We're inserting into the source column position.
             let target_column_idx = source_col_idx;
@@ -1881,22 +1440,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 source_tile_was_active,
                 removed.width,
                 removed.is_full_width,
-                Some(self.options.animations.window_movement.0),
             );
 
             if source_tile_was_active {
                 // We added to the left, don't activate even further left on removal.
                 self.activate_prev_column_on_removal = None;
             }
-
-            if target_column_idx <= self.active_column_idx {
-                // Tiles to the left animate from the following column.
-                offset.x += self.column_x(target_column_idx + 1) - self.column_x(target_column_idx);
-            }
-
-            let new_col = &mut self.columns[target_column_idx];
-            offset += prev_off - new_col.tile_offset(0);
-            new_col.tiles[0].animate_move_from(offset);
         }
     }
 
@@ -1922,11 +1471,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             (source_col_idx, source_tile_idx)
         };
 
-        let cur_x = self.column_x(source_col_idx);
-
         let source_column = &self.columns[source_col_idx];
-        let mut offset = source_column.render_offset();
-        let prev_off = source_column.tile_offset(source_tile_idx);
 
         let source_tile_was_active = self.active_column_idx == source_col_idx
             && source_column.active_tile_idx == source_tile_idx;
@@ -1939,33 +1484,17 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // Move into adjacent column.
             let target_column_idx = source_col_idx;
 
-            offset.x += cur_x - self.column_x(source_col_idx + 1);
-            offset -= self.columns[source_col_idx + 1].render_offset();
-
             if source_tile_was_active {
                 // Make sure the target column gets activated.
                 self.activate_prev_column_on_removal = None;
             }
 
-            let RemovedTile { tile, .. } = self.remove_tile_by_idx(
-                source_col_idx,
-                0,
-                Transaction::new(),
-                Some(self.options.animations.window_movement.0),
-            );
+            let RemovedTile { tile, .. } =
+                self.remove_tile_by_idx(source_col_idx, 0, Transaction::new());
             self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active);
-
-            let target_column = &mut self.columns[target_column_idx];
-            offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
-
-            let new_tile = target_column.tiles.last_mut().unwrap();
-            new_tile.animate_move_from(offset);
         } else {
             // Move out of column.
-            let prev_width = self.data[source_col_idx].width;
-
-            let removed =
-                self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new(), None);
+            let removed = self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new());
 
             let target_column_idx = source_col_idx + 1;
 
@@ -1975,20 +1504,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 source_tile_was_active,
                 removed.width,
                 removed.is_full_width,
-                Some(self.options.animations.window_movement.0),
             );
-
-            offset.x += if self.active_column_idx <= target_column_idx {
-                // Tiles to the right animate to the following column.
-                cur_x - self.column_x(target_column_idx)
-            } else {
-                // Tiles to the left animate for a change in width.
-                -f64::max(0., prev_width - self.data[target_column_idx].width)
-            };
-
-            let new_col = &mut self.columns[target_column_idx];
-            offset += prev_off - new_col.tile_offset(0);
-            new_col.tiles[0].animate_move_from(offset);
         }
     }
 
@@ -2004,20 +1520,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let target_column_idx = self.active_column_idx;
         let source_column_idx = self.active_column_idx + 1;
 
-        let mut offset = self.columns[source_column_idx].render_offset();
-        offset.x += self.column_x(source_column_idx);
-        offset.x -= self.column_x(target_column_idx);
-        let prev_off = self.columns[source_column_idx].tile_offset(0);
-
-        let removed = self.remove_tile_by_idx(source_column_idx, 0, Transaction::new(), None);
+        let removed = self.remove_tile_by_idx(source_column_idx, 0, Transaction::new());
         self.add_tile_to_column(target_column_idx, None, removed.tile, false);
-
-        let target_column = &mut self.columns[target_column_idx];
-        offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
-        offset -= target_column.render_offset();
-
-        let new_tile = target_column.tiles.last_mut().unwrap();
-        new_tile.animate_move_from(offset);
     }
 
     pub fn expel_from_column(&mut self) {
@@ -2027,7 +1531,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let source_col_idx = self.active_column_idx;
         let target_col_idx = self.active_column_idx + 1;
-        let cur_x = self.column_x(source_col_idx);
 
         let source_column = &self.columns[self.active_column_idx];
         if source_column.tiles.len() == 1 {
@@ -2036,11 +1539,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let source_tile_idx = source_column.tiles.len() - 1;
 
-        let mut offset = source_column.render_offset();
-        let prev_off = source_column.tile_offset(source_tile_idx);
-
         let removed =
-            self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new(), None);
+            self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new());
 
         self.add_tile(
             Some(target_col_idx),
@@ -2048,14 +1548,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             false,
             removed.width,
             removed.is_full_width,
-            Some(self.options.animations.window_movement.0),
         );
-
-        offset.x += cur_x - self.column_x(target_col_idx);
-
-        let new_col = &mut self.columns[target_col_idx];
-        offset += prev_off - new_col.tile_offset(0);
-        new_col.tiles[0].animate_move_from(offset);
     }
 
     pub fn swap_window_in_direction(&mut self, direction: ScrollDirection) {
@@ -2096,16 +1589,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let target_tile_idx = self.columns[target_column_idx].active_tile_idx;
         let source_column_drained = self.columns[source_column_idx].tiles.len() == 1;
 
-        // capture the original positions of the tiles
-        let (mut source_pt, mut target_pt) = (
-            self.columns[source_column_idx].render_offset()
-                + self.columns[source_column_idx].tile_offset(source_tile_idx),
-            self.columns[target_column_idx].render_offset()
-                + self.columns[target_column_idx].tile_offset(target_tile_idx),
-        );
-        source_pt.x += self.column_x(source_column_idx);
-        target_pt.x += self.column_x(target_column_idx);
-
         let transaction = Transaction::new();
 
         // If the source column contains a single tile, this will also remove the column.
@@ -2115,7 +1598,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             source_column_idx,
             source_tile_idx,
             transaction.clone(),
-            None,
         );
 
         {
@@ -2140,19 +1622,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 adjusted_target_column_idx,
                 target_tile_idx + 1,
                 transaction.clone(),
-                None,
             );
 
             if source_column_drained {
                 // recreate the drained column with only the target tile
-                self.add_tile(
-                    Some(source_column_idx),
-                    target_tile,
-                    true,
-                    source_removed.width,
-                    source_removed.is_full_width,
-                    None,
-                )
+                self.add_tile(Some(source_column_idx), target_tile, true, source_removed.width, source_removed.is_full_width)
             } else {
                 // simply add the removed target tile to the source column
                 self.add_tile_to_column(
@@ -2167,21 +1641,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // update the active tile in the modified columns
         self.columns[source_column_idx].active_tile_idx = source_tile_idx;
         self.columns[target_column_idx].active_tile_idx = target_tile_idx;
-
-        // Animations
-        self.columns[target_column_idx].tiles[target_tile_idx]
-            .animate_move_from(source_pt - target_pt);
-        self.columns[target_column_idx].tiles[target_tile_idx].ensure_alpha_animates_to_1();
-
-        // FIXME: this stop_move_animations() causes the target tile animation to "reset" when
-        // swapping. It's here as a workaround to stop the unwanted animation of moving the source
-        // tile down when adding the target tile above it. This code needs to be written in some
-        // other way not to trigger that animation, or to cancel it properly, so that swap doesn't
-        // cancel all ongoing target tile animations.
-        self.columns[source_column_idx].tiles[source_tile_idx].stop_move_animations();
-        self.columns[source_column_idx].tiles[source_tile_idx]
-            .animate_move_from(target_pt - source_pt);
-        self.columns[source_column_idx].tiles[source_tile_idx].ensure_alpha_animates_to_1();
 
         self.activate_column(target_column_idx);
     }
@@ -2230,11 +1689,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        self.animate_view_offset_to_column_centered(
-            None,
-            self.active_column_idx,
-            self.options.animations.horizontal_view_movement.0,
-        );
+        self.animate_view_offset_to_column_centered(None, self.active_column_idx);
 
         let col = &mut self.columns[self.active_column_idx];
         cancel_resize_for_column(&mut self.interactive_resize, col);
@@ -2409,9 +1864,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let view_off = Point::from((-self.view_pos(), 0.));
         self.columns_in_render_order().map(move |(col, col_x)| {
             let col_off = Point::from((col_x, 0.));
-            let col_render_off = col.render_offset();
-            let pos = view_off + col_off + col_render_off;
-            (col, pos)
+            (col, view_off + col_off)
         })
     }
 
@@ -2421,9 +1874,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let view_off = Point::from((-self.view_pos(), 0.));
         self.columns_in_render_order_mut().map(move |(col, col_x)| {
             let col_off = Point::from((col_x, 0.));
-            let col_render_off = col.render_offset();
-            let pos = view_off + col_off + col_render_off;
-            (col, pos)
+            (col, view_off + col_off)
         })
     }
 
@@ -2435,7 +1886,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .flat_map(move |(col, col_pos)| {
                 col.tiles_in_render_order()
                     .map(move |(tile, tile_off, visible)| {
-                        let pos = col_pos + tile_off + tile.render_offset();
+                        let pos = col_pos + tile_off;
                         // Round to physical pixels.
                         let pos = pos.to_physical_precise_round(scale).to_logical(scale);
                         (tile, pos, visible)
@@ -2452,7 +1903,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .flat_map(move |(col, col_pos)| {
                 col.tiles_in_render_order_mut()
                     .map(move |(tile, tile_off)| {
-                        let mut pos = col_pos + tile_off + tile.render_offset();
+                        let mut pos = col_pos + tile_off;
                         // Round to physical pixels.
                         if round {
                             pos = pos.to_physical_precise_round(scale).to_logical(scale);
@@ -2948,19 +2399,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         mut ctx: RenderCtx<R>,
         xray_pos: XrayPos,
         focus_ring: bool,
-        layer: RenderLayer,
         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
-
-        // Draw the closing windows on top of the other windows.
-        if layer.is_normal() {
-            let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
-            for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), view_rect, scale);
-                push(elem.into());
-            }
-        }
 
         if self.columns.is_empty() {
             return;
@@ -2970,12 +2411,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // This matches self.tiles_with_render_positions().
         for (col, col_pos) in self.columns_with_render_positions() {
-            // Skip columns belonging to a different render layer.
-            if layer.is_normal() == col.is_moving_between_workspaces() {
-                first = false;
-                continue;
-            }
-
             // Draw the tab indicator on top.
             {
                 let pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
@@ -2984,7 +2419,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             }
 
             for (tile, tile_off, visible) in col.tiles_in_render_order() {
-                let tile_pos = col_pos + tile_off + tile.render_offset();
+                let tile_pos = col_pos + tile_off;
                 // Round to physical pixels.
                 let tile_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
 
@@ -2994,12 +2429,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 let focus_ring = focus_ring && first;
                 first = false;
 
-                // In the scrolling layout, we currently use visible only for hidden tabs in the
-                // tabbed mode. We want to animate their opacity when going in and out of tabbed
-                // mode, so we don't want to apply "visible" immediately. However, "visible" is
-                // also used for input handling, and there we *do* want to apply it immediately.
-                // So, let's just selectively ignore "visible" here when animating alpha.
-                let visible = visible || tile.alpha_animation.is_some();
                 if !visible {
                     continue;
                 }
@@ -3038,7 +2467,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     continue;
                 }
 
-                let tile_pos = col_pos + tile_off + tile.render_offset();
+                let tile_pos = col_pos + tile_off;
                 // Round to physical pixels.
                 let tile_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
 
@@ -3062,7 +2491,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let gesture = ViewGesture {
             current_view_offset: self.view_offset.current(),
-            animation: None,
             tracker: SwipeTracker::new(),
             delta_from_tracker: self.view_offset.current(),
             stationary_view_offset: self.view_offset.stationary(),
@@ -3085,7 +2513,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let gesture = ViewGesture {
             current_view_offset: self.view_offset.current(),
-            animation: None,
             tracker: SwipeTracker::new(),
             delta_from_tracker: self.view_offset.current(),
             stationary_view_offset: self.view_offset.stationary(),
@@ -3223,7 +2650,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         } else {
             1.
         };
-        let velocity = gesture.tracker.velocity() * norm_factor;
         let pos = gesture.tracker.pos() * norm_factor;
         let current_view_offset = pos + gesture.delta_from_tracker;
 
@@ -3232,7 +2658,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return true;
         }
 
-        // Figure out where the gesture would stop after deceleration.
+        // Figure out where the gesture would have stopped after deceleration.
         let end_pos = gesture.tracker.projected_end_pos() * norm_factor;
         let target_view_offset = end_pos + gesture.delta_from_tracker;
 
@@ -3504,7 +2930,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         let new_col_x = self.column_x(new_col_idx);
-        let delta = active_col_x - new_col_x;
 
         if self.active_column_idx != new_col_idx {
             self.view_offset_to_restore = None;
@@ -3514,16 +2939,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let target_view_offset = target_snap.view_pos - new_col_x;
 
-        self.view_offset = ViewOffset::Animation(Animation::new(
-            self.clock.clone(),
-            current_view_offset + delta,
-            target_view_offset,
-            velocity,
-            self.options.animations.horizontal_view_movement.0,
-        ));
-
-        // HACK: deal with things like snapping to the right edge of a larger-than-view window.
-        self.animate_view_offset_to_column(None, new_col_idx, None);
+        self.view_offset = ViewOffset::Static(target_view_offset);
 
         true
     }
@@ -3536,15 +2952,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if gesture.dnd_last_event_time.is_some() && gesture.tracker.pos() == 0. {
             // DnD didn't scroll anything, so preserve the current view position (rather than
             // snapping the window).
-
-            // If there's an ongoing animation within the gesture (e.g. from a window being removed
-            // during DnD), preserve it.
-            if let Some(mut anim) = gesture.animation.take() {
-                anim.offset(gesture.current_view_offset);
-                self.view_offset = ViewOffset::Animation(anim);
-            } else {
-                self.view_offset = ViewOffset::Static(gesture.delta_from_tracker);
-            }
+            self.view_offset = ViewOffset::Static(gesture.current_view_offset);
 
             if !self.columns.is_empty() {
                 // Just in case, make sure the active window remains on screen.
@@ -3839,32 +3247,21 @@ impl ViewOffset {
     pub fn current(&self) -> f64 {
         match self {
             ViewOffset::Static(offset) => *offset,
-            ViewOffset::Animation(anim) => anim.value(),
-            ViewOffset::Gesture(gesture) => {
-                gesture.current_view_offset
-                    + gesture.animation.as_ref().map_or(0., |anim| anim.value())
-            }
+            ViewOffset::Gesture(gesture) => gesture.current_view_offset,
         }
     }
 
     /// Returns the target view offset suitable for computing the new view offset.
     pub fn target(&self) -> f64 {
-        match self {
-            ViewOffset::Static(offset) => *offset,
-            ViewOffset::Animation(anim) => anim.to(),
-            // This can be used for example if a gesture is interrupted.
-            ViewOffset::Gesture(gesture) => gesture.current_view_offset,
-        }
+        self.current()
     }
 
     /// Returns a view offset value suitable for saving and later restoration.
     ///
-    /// This means that it shouldn't return an in-progress animation or gesture value.
+    /// This means that it shouldn't return an in-progress gesture value.
     fn stationary(&self) -> f64 {
         match self {
             ViewOffset::Static(offset) => *offset,
-            // For animations we can return the final value.
-            ViewOffset::Animation(anim) => anim.to(),
             ViewOffset::Gesture(gesture) => gesture.stationary_view_offset,
         }
     }
@@ -3881,18 +3278,9 @@ impl ViewOffset {
         matches!(&self, ViewOffset::Gesture(gesture) if gesture.dnd_last_event_time.is_some())
     }
 
-    pub fn is_animation_ongoing(&self) -> bool {
-        match self {
-            ViewOffset::Static(_) => false,
-            ViewOffset::Animation(_) => true,
-            ViewOffset::Gesture(gesture) => gesture.animation.is_some(),
-        }
-    }
-
     pub fn offset(&mut self, delta: f64) {
         match self {
             ViewOffset::Static(offset) => *offset += delta,
-            ViewOffset::Animation(anim) => anim.offset(delta),
             ViewOffset::Gesture(gesture) => {
                 gesture.stationary_view_offset += delta;
                 gesture.delta_from_tracker += delta;
@@ -3909,13 +3297,6 @@ impl ViewOffset {
 
     pub fn stop_anim_and_gesture(&mut self) {
         *self = ViewOffset::Static(self.current());
-    }
-}
-
-impl ViewGesture {
-    fn animate_from(&mut self, from: f64, clock: Clock, config: niri_config::Animation) {
-        let current = self.animation.as_ref().map_or(0., Animation::value);
-        self.animation = Some(Animation::new(clock, from + current, 0., 0., config));
     }
 }
 
@@ -4012,8 +3393,6 @@ impl<W: LayoutElement> Column<W> {
             is_pending_fullscreen: false,
             display_mode,
             tab_indicator: TabIndicator::new(options.layout.tab_indicator),
-            move_x_animation: None,
-            move_y_animation: None,
             view_size,
             working_area,
             parent_area,
@@ -4031,17 +3410,6 @@ impl<W: LayoutElement> Column<W> {
             SizingMode::Normal => (),
             SizingMode::Maximized => rv.set_maximized(true),
             SizingMode::Fullscreen => rv.set_fullscreen(true),
-        }
-
-        // Animate the tab indicator for new columns.
-        if display_mode == ColumnDisplay::Tabbed
-            && !rv.options.layout.tab_indicator.hide_when_single_tab
-            && rv.sizing_mode().is_normal()
-        {
-            // Usually new columns are created together with window movement actions. For new
-            // windows, we handle that in start_open_animation().
-            rv.tab_indicator
-                .start_open_animation(rv.clock.clone(), rv.options.animations.window_movement.0);
         }
 
         rv
@@ -4119,65 +3487,8 @@ impl<W: LayoutElement> Column<W> {
         self.tab_indicator.update_shaders();
     }
 
-    pub fn advance_animations(&mut self) {
-        if let Some(move_) = &mut self.move_x_animation {
-            if move_.anim.is_done() {
-                self.move_x_animation = None;
-            }
-        }
-        if let Some(move_) = &mut self.move_y_animation {
-            if move_.anim.is_done() {
-                self.move_y_animation = None;
-            }
-        }
-
-        for tile in &mut self.tiles {
-            tile.advance_animations();
-        }
-
-        self.tab_indicator.advance_animations();
-    }
-
-    pub fn are_animations_ongoing(&self) -> bool {
-        self.move_x_animation.is_some()
-            || self.move_y_animation.is_some()
-            || self.tab_indicator.are_animations_ongoing()
-            || self.tiles.iter().any(Tile::are_animations_ongoing)
-    }
-
-    pub fn are_transitions_ongoing(&self) -> bool {
-        self.move_x_animation.is_some()
-            || self.move_y_animation.is_some()
-            || self.tab_indicator.are_animations_ongoing()
-            || self.tiles.iter().any(Tile::are_transitions_ongoing)
-    }
-
-    pub fn is_moving_between_workspaces(&self) -> bool {
-        self.move_y_animation
-            .as_ref()
-            .is_some_and(|anim| anim.is_between_workspaces)
-            || self
-                .move_x_animation
-                .as_ref()
-                .is_some_and(|anim| anim.is_between_workspaces)
-            // When moving a window between workspaces into the scrolling layout, it will be
-            // immediately put into a new column, however the Y move animation and the
-            // moving-between-workspaces flag will be set on the tile rather than on that new
-            // column. Since the scrolling layout rendering checks moving between workspaces
-            // per-column rather than per-tile, we need to include the tiles here.
-            //
-            // This is not always visually correct: for example, interactive-moving a tile into an
-            // otherwise stationary column will now cause that entire column to draw unculled. I'm
-            // not sure there's a good solution overall for all edge cases here. Consider that the
-            // column tab indicator needs to draw on top of the tiles, but in this counterexample
-            // above, the column is stationary, so the single moving tile would instead need to draw
-            // on top of the tab indicator.
-            //
-            // I'm going with this simple check for now that should look ok in most cases.
-            || self
-                .tiles
-                .iter()
-                .any(|tile| tile.is_moving_between_workspaces())
+    pub fn needs_update(&self) -> bool {
+        self.tiles.iter().any(Tile::needs_update)
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
@@ -4186,7 +3497,7 @@ impl<W: LayoutElement> Column<W> {
             let is_active = is_active && tile_idx == active_idx;
 
             let mut tile_view_rect = view_rect;
-            tile_view_rect.loc -= tile_off + tile.render_offset();
+            tile_view_rect.loc -= tile_off;
             tile.update_render_elements(is_active, tile_view_rect);
         }
 
@@ -4197,8 +3508,7 @@ impl<W: LayoutElement> Column<W> {
             .map(|(tile_idx, (tile, tile_off))| {
                 let is_active = tile_idx == active_idx;
                 let is_urgent = tile.window().is_urgent();
-                let tile_pos = tile_off + tile.render_offset();
-                TabInfo::from_tile(tile, tile_pos, is_active, is_urgent, &config)
+                TabInfo::from_tile(tile, tile_off, is_active, is_urgent, &config)
             });
 
         // Hide the tab indicator in fullscreen. If you have it configured to overlap the window,
@@ -4233,99 +3543,6 @@ impl<W: LayoutElement> Column<W> {
             SizingMode::Maximized
         } else {
             SizingMode::Normal
-        }
-    }
-
-    pub fn render_offset(&self) -> Point<f64, Logical> {
-        let mut offset = Point::from((0., 0.));
-
-        if let Some(move_) = &self.move_x_animation {
-            offset.x += move_.from * move_.anim.value();
-        }
-        if let Some(move_) = &self.move_y_animation {
-            offset.y += move_.from * move_.anim.value();
-        }
-
-        offset
-    }
-
-    pub fn animate_move_from(&mut self, from: Point<f64, Logical>) {
-        self.animate_move_from_with_config(from, self.options.animations.window_movement.0);
-    }
-
-    pub fn animate_move_from_with_config(
-        &mut self,
-        from: Point<f64, Logical>,
-        config: niri_config::Animation,
-    ) {
-        self.animate_move_x_from_with_config(from.x, config);
-        self.animate_move_y_from_with_config(from.y, config);
-    }
-
-    pub fn animate_move_x_from(&mut self, from_x_offset: f64) {
-        self.animate_move_x_from_with_config(
-            from_x_offset,
-            self.options.animations.window_movement.0,
-        );
-    }
-
-    pub fn animate_move_x_from_with_config(
-        &mut self,
-        from_x_offset: f64,
-        config: niri_config::Animation,
-    ) {
-        let (current_offset, current_between) =
-            self.move_x_animation.as_ref().map_or((0., false), |move_| {
-                (move_.from * move_.anim.value(), move_.is_between_workspaces)
-            });
-
-        let anim = Animation::new(self.clock.clone(), 1., 0., 0., config);
-        self.move_x_animation = Some(MoveAnimation {
-            anim,
-            from: from_x_offset + current_offset,
-            is_between_workspaces: current_between,
-        });
-    }
-
-    pub fn animate_move_y_from(&mut self, from_y_offset: f64) {
-        self.animate_move_y_from_with_config(
-            from_y_offset,
-            self.options.animations.window_movement.0,
-        );
-    }
-
-    pub fn animate_move_y_from_with_config(
-        &mut self,
-        from_y_offset: f64,
-        config: niri_config::Animation,
-    ) {
-        let (current_offset, current_between) =
-            self.move_y_animation.as_ref().map_or((0., false), |move_| {
-                (move_.from * move_.anim.value(), move_.is_between_workspaces)
-            });
-
-        let anim = Animation::new(self.clock.clone(), 1., 0., 0., config);
-        self.move_y_animation = Some(MoveAnimation {
-            anim,
-            from: from_y_offset + current_offset,
-            is_between_workspaces: current_between,
-        });
-    }
-
-    pub fn offset_move_anim_current(&mut self, offset: f64) {
-        if let Some(move_) = self.move_x_animation.as_mut() {
-            // If the anim is almost done, there's little point trying to offset it; we can let
-            // things jump. If it turns out like a bad idea, we could restart the anim instead.
-            let value = move_.anim.value();
-            if value > 0.001 {
-                move_.from += offset / value;
-            }
-        }
-    }
-
-    pub fn set_anim_y_between_workspaces(&mut self) {
-        if let Some(anim) = &mut self.move_y_animation {
-            anim.is_between_workspaces = true;
         }
     }
 
@@ -4414,9 +3631,6 @@ impl<W: LayoutElement> Column<W> {
         }
 
         self.active_tile_idx = idx;
-
-        self.tiles[idx].ensure_alpha_animates_to_1();
-
         true
     }
 
@@ -4428,11 +3642,6 @@ impl<W: LayoutElement> Column<W> {
     fn add_tile_at(&mut self, idx: usize, mut tile: Tile<W>) {
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
-        // Inserting a tile pushes down all tiles below it, but also in always-centering mode it
-        // will affect the X position of all tiles in the column.
-        let mut prev_offsets = Vec::with_capacity(self.tiles.len() + 1);
-        prev_offsets.extend(self.tile_offsets().take(self.tiles.len()));
-
         if self.display_mode != ColumnDisplay::Tabbed {
             self.is_pending_fullscreen = false;
             self.is_pending_maximized = false;
@@ -4442,16 +3651,6 @@ impl<W: LayoutElement> Column<W> {
             .insert(idx, TileData::new(&tile, WindowHeight::auto_1()));
         self.tiles.insert(idx, tile);
         self.update_tile_sizes(true);
-
-        // Animate tiles according to the offset changes.
-        prev_offsets.insert(idx, Point::default());
-        for (i, ((tile, offset), prev)) in zip(self.tiles_mut(), prev_offsets).enumerate() {
-            if i == idx {
-                continue;
-            }
-
-            tile.animate_move_from(prev - offset);
-        }
     }
 
     fn update_window(&mut self, window: &W::Id) {
@@ -4462,52 +3661,8 @@ impl<W: LayoutElement> Column<W> {
             .find(|(_, tile)| tile.window().id() == window)
             .unwrap();
 
-        let prev_height = self.data[tile_idx].size.h;
-
         tile.update_window();
         self.data[tile_idx].update(tile);
-
-        let offset = prev_height - self.data[tile_idx].size.h;
-
-        let is_tabbed = self.display_mode == ColumnDisplay::Tabbed;
-
-        // Move windows below in tandem with resizing.
-        //
-        // FIXME: in always-centering mode, window resizing will affect the offsets of all other
-        // windows in the column, so they should all be animated. How should this interact with
-        // animated vs. non-animated resizes? For example, an animated +20 resize followed by two
-        // non-animated -10 resizes.
-        if !is_tabbed && offset != 0. {
-            if tile.resize_animation().is_some() {
-                // If there's a resize animation (that may have just started in
-                // tile.update_window()), then the apparent size change is smooth with no sudden
-                // jumps. This corresponds to adding an Y animation to tiles below.
-                for tile in &mut self.tiles[tile_idx + 1..] {
-                    tile.animate_move_y_from_with_config(
-                        offset,
-                        self.options.animations.window_resize.anim,
-                    );
-                }
-            } else {
-                // There's no resize animation, but the offset is nonzero. This could happen for
-                // example:
-                // - if the window resized on its own, which we don't animate
-                // - if the window resized by less than 10 px (the resize threshold)
-                //
-                // The latter case could also cancel an ongoing resize animation.
-                //
-                // Now, stationary tiles below shouldn't react to this offset change in any way,
-                // i.e. their apparent Y position should jump together with the resize. However,
-                // tiles below that are already animating an Y movement should offset their
-                // animations to avoid the jump.
-                //
-                // Notably, this is necessary to fix the animation jump when resizing height back
-                // and forth in quick succession (in a way that cancels the resize animation).
-                for tile in &mut self.tiles[tile_idx + 1..] {
-                    tile.offset_move_y_anim_current(offset);
-                }
-            }
-        }
     }
 
     /// Extra size taken up by elements in the column such as the tab indicator.
@@ -4884,19 +4039,9 @@ impl<W: LayoutElement> Column<W> {
             return false;
         }
 
-        let mut ys = self.tile_offsets().skip(self.active_tile_idx);
-        let active_y = ys.next().unwrap().y;
-        let next_y = ys.next().unwrap().y;
-        drop(ys);
-
         self.tiles.swap(self.active_tile_idx, new_idx);
         self.data.swap(self.active_tile_idx, new_idx);
         self.active_tile_idx = new_idx;
-
-        // Animate the movement.
-        let new_active_y = self.tile_offset(new_idx).y;
-        self.tiles[new_idx].animate_move_y_from(active_y - new_active_y);
-        self.tiles[new_idx + 1].animate_move_y_from(active_y - next_y);
 
         true
     }
@@ -4907,19 +4052,9 @@ impl<W: LayoutElement> Column<W> {
             return false;
         }
 
-        let mut ys = self.tile_offsets().skip(self.active_tile_idx);
-        let active_y = ys.next().unwrap().y;
-        let next_y = ys.next().unwrap().y;
-        drop(ys);
-
         self.tiles.swap(self.active_tile_idx, new_idx);
         self.data.swap(self.active_tile_idx, new_idx);
         self.active_tile_idx = new_idx;
-
-        // Animate the movement.
-        let new_active_y = self.tile_offset(new_idx).y;
-        self.tiles[new_idx].animate_move_y_from(active_y - new_active_y);
-        self.tiles[new_idx - 1].animate_move_y_from(next_y - active_y);
 
         true
     }
@@ -5244,56 +4379,9 @@ impl<W: LayoutElement> Column<W> {
             return;
         }
 
-        // Animate the movement.
-        //
-        // We're doing some shortcuts here because we know that currently normal vs. tabbed can
-        // only cause a vertical shift + a shift to the origin.
-        //
-        // Doing it this way to avoid storing all tile positions in a vector. If more display modes
-        // are added it might be simpler to just collect everything into a smallvec.
-        let prev_origin = self.tiles_origin();
         self.display_mode = display;
-        let new_origin = self.tiles_origin();
-        let origin_delta = prev_origin - new_origin;
-
-        // When need to walk the tiles in the normal display mode to get the right offsets.
-        self.display_mode = ColumnDisplay::Normal;
-        for (tile, pos) in self.tiles_mut() {
-            let mut y_delta = pos.y - prev_origin.y;
-
-            // Invert the Y motion when transitioning *to* normal display mode.
-            if display == ColumnDisplay::Normal {
-                y_delta *= -1.;
-            }
-
-            let mut delta = origin_delta;
-            delta.y += y_delta;
-            tile.animate_move_from(delta);
-        }
-
-        // Animate the opacity.
-        for (idx, tile) in self.tiles.iter_mut().enumerate() {
-            let is_active = idx == self.active_tile_idx;
-            if !is_active {
-                let (from, to) = if display == ColumnDisplay::Tabbed {
-                    (1., 0.)
-                } else {
-                    (0., 1.)
-                };
-                tile.animate_alpha(from, to, self.options.animations.window_movement.0);
-            }
-        }
-
-        // Animate the appearance of the tab indicator.
-        if display == ColumnDisplay::Tabbed {
-            self.tab_indicator.start_open_animation(
-                self.clock.clone(),
-                self.options.animations.window_movement.0,
-            );
-        }
 
         // Now switch the display mode for real.
-        self.display_mode = display;
         self.update_tile_sizes(true);
     }
 
@@ -5431,55 +4519,15 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn tab_indicator_area(&self) -> Rectangle<f64, Logical> {
-        // We'd like to use the active tile's animated size for the tab indicator, however we need
-        // to be mindful of the case where the active tile is smaller than some other tile in the
-        // column. The column assumes the size of the largest tile.
-        //
-        // We expect users to mainly resize tabbed columns by width, so matching the animated size
-        // is more important here. Besides, we always try to resize all windows in a column to the
-        // same width when possible, and also the animation for going into tabbed mode doesn't move
-        // tiles horizontally as much.
-        //
-        // For height though, it's a different story. First, users probably aren't resizing a
-        // tabbed column by height. Second, we don't match windows by height, so it's easy to have
-        // a smaller active tile than the rest of the column, e.g. by adding a fixed-size dialog.
-        // Then, switching to that dialog and back should ideally keep the tab indicator position
-        // fixed. Third, the animation for making a column tabbed moves tiles vertically, and using
-        // the active tile's animated size in this case only works for the topmost tile, and looks
-        // broken otherwise.
         let mut max_height = 0.;
         for tile in &self.tiles {
             max_height = f64::max(max_height, tile.tile_size().h);
         }
 
         let tile = &self.tiles[self.active_tile_idx];
-        let area_size = Size::from((tile.animated_tile_size().w, max_height));
+        let area_size = Size::from((tile.tile_size().w, max_height));
 
         Rectangle::new(self.tiles_origin(), area_size)
-    }
-
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
-        for tile in &mut self.tiles {
-            if tile.window().id() == id {
-                tile.start_open_animation();
-
-                // Animate the appearance of the tab indicator.
-                if self.display_mode == ColumnDisplay::Tabbed
-                    && self.sizing_mode().is_normal()
-                    && self.tiles.len() == 1
-                    && !self.tab_indicator.config().hide_when_single_tab
-                {
-                    self.tab_indicator.start_open_animation(
-                        self.clock.clone(),
-                        self.options.animations.window_open.anim,
-                    );
-                }
-
-                return true;
-            }
-        }
-
-        false
     }
 
     #[cfg(test)]

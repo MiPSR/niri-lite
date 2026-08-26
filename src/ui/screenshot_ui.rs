@@ -1,13 +1,11 @@
-use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 use std::iter::zip;
-use std::rc::Rc;
 
 use anyhow::Context;
 use arrayvec::ArrayVec;
-use niri_config::{Action, Config};
+use niri_config::Action;
 use niri_ipc::SizeChange;
 use pango::{Alignment, FontDescription};
 use pangocairo::cairo::{self, ImageSurface};
@@ -21,7 +19,6 @@ use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::animation::{Animation, Clock};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -52,17 +49,12 @@ const TEXT_SHOW_P: &str =
 pub enum ScreenshotUi {
     Closed {
         last_selection: Option<(WeakOutput, Rectangle<i32, Physical>)>,
-        clock: Clock,
-        config: Rc<RefCell<Config>>,
     },
     Open {
         selection: (Output, Point<i32, Physical>, Point<i32, Physical>),
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
-        open_anim: Animation,
-        clock: Clock,
-        config: Rc<RefCell<Config>>,
         path: Option<String>,
     },
 }
@@ -127,11 +119,9 @@ impl Button {
 }
 
 impl ScreenshotUi {
-    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
+    pub fn new() -> Self {
         Self::Closed {
             last_selection: None,
-            clock,
-            config,
         }
     }
 
@@ -148,12 +138,7 @@ impl ScreenshotUi {
             return false;
         }
 
-        let Self::Closed {
-            last_selection,
-            clock,
-            config,
-        } = self
-        else {
+        let Self::Closed { last_selection } = self else {
             return false;
         };
 
@@ -224,19 +209,11 @@ impl ScreenshotUi {
             })
             .collect();
 
-        let open_anim = {
-            let c = config.borrow();
-            Animation::new(clock.clone(), 0., 1., 0., c.animations.screenshot_ui_open.0)
-        };
-
         *self = Self::Open {
             selection,
             output_data,
             button: Button::Up,
             show_pointer,
-            open_anim,
-            clock: clock.clone(),
-            config: config.clone(),
             path,
         };
 
@@ -246,13 +223,7 @@ impl ScreenshotUi {
     }
 
     pub fn close(&mut self) -> bool {
-        let Self::Open {
-            selection,
-            clock,
-            config,
-            ..
-        } = self
-        else {
+        let Self::Open { selection, .. } = self else {
             return false;
         };
 
@@ -261,11 +232,7 @@ impl ScreenshotUi {
             rect_from_corner_points(selection.1, selection.2),
         ));
 
-        *self = Self::Closed {
-            last_selection,
-            clock: clock.clone(),
-            config: config.clone(),
-        };
+        *self = Self::Closed { last_selection };
 
         true
     }
@@ -536,14 +503,8 @@ impl ScreenshotUi {
         self.update_buffers();
     }
 
-    pub fn advance_animations(&mut self) {}
-
     pub fn are_animations_ongoing(&self) -> bool {
-        let Self::Open { open_anim, .. } = self else {
-            return false;
-        };
-
-        !open_anim.is_done()
+        false
     }
 
     fn update_buffers(&mut self) {
@@ -631,7 +592,6 @@ impl ScreenshotUi {
             output_data,
             show_pointer,
             button,
-            open_anim,
             ..
         } = self
         else {
@@ -643,7 +603,6 @@ impl ScreenshotUi {
         };
 
         let scale = output_data.scale;
-        let progress = open_anim.clamped_value().clamp(0., 1.) as f32;
 
         // The help panel goes on top.
         if let Some((show, hide)) = &output_data.panel {
@@ -660,7 +619,7 @@ impl ScreenshotUi {
             let elem = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
                 buffer.clone(),
                 location,
-                alpha * progress,
+                alpha,
                 None,
                 None,
                 Kind::Unspecified,
@@ -672,7 +631,7 @@ impl ScreenshotUi {
             let elem = SolidColorRenderElement::from_buffer(
                 buffer,
                 loc.to_f64().to_logical(scale),
-                progress,
+                1.,
                 Kind::Unspecified,
             );
             push(elem.into());

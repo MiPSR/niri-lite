@@ -1,6 +1,6 @@
 use niri_config::layer_rule::{LayerRule, Match};
 use niri_config::utils::MergeWith as _;
-use niri_config::{BackgroundEffect, BlockOutFrom, CornerRadius, ResolvedPopupsRules, ShadowRule};
+use niri_config::{BackgroundEffect, BlockOutFrom, ResolvedPopupsRules, ShadowRule};
 use smithay::desktop::LayerSurface;
 use smithay::wayland::shell::wlr_layer::Layer;
 
@@ -19,8 +19,6 @@ pub struct ResolvedLayerRules {
     /// Shadow overrides.
     pub shadow: ShadowRule,
 
-    /// Corner radius to assume this layer surface has.
-    pub geometry_corner_radius: Option<CornerRadius>,
 
     /// Whether to place this layer surface within the overview backdrop.
     pub place_within_backdrop: bool,
@@ -65,9 +63,6 @@ impl ResolvedLayerRules {
             }
             if let Some(x) = rule.block_out_from {
                 resolved.block_out_from = Some(x);
-            }
-            if let Some(x) = rule.geometry_corner_radius {
-                resolved.geometry_corner_radius = Some(x);
             }
             if let Some(x) = rule.place_within_backdrop {
                 resolved.place_within_backdrop = x;

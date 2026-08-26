@@ -22,6 +22,17 @@ This fork tracks upstream and only diverges where noted below.
 - The CLI (`src/cli.rs`)
 - The `niri msg` client (`src/ipc/client.rs`)
 - clap and completion dependencies (`Cargo.toml`)
+- All animations, physically removed: the animation engine, springs,
+  easings, open/close/move/resize/alpha animation states, the `keyframe`
+  dependency (`src/animation/`, `src/layout/opening_window.rs`,
+  `src/layout/closing_window.rs`, `src/render_helpers/resize.rs`), and the
+  `animations` config section. Every action lands instantly; only
+  gesture-driven view offsets and the IPC `DoScreenTransition` crossfade
+  remain.
+- All corner rounding, physically removed: the `CornerRadius` type,
+  `geometry-corner-radius` window/layer rules, tab-indicator and MRU-highlight
+  radii, and every radius parameter through the render helpers
+  (`niri-config/src/appearance.rs`, `src/render_helpers/`)
 
 ## Added
 

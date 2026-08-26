@@ -1,12 +1,11 @@
 use std::iter::zip;
 use std::mem;
 
-use niri_config::{CornerRadius, Gradient, GradientRelativeTo, TabIndicatorPosition};
+use niri_config::{Gradient, GradientRelativeTo, TabIndicatorPosition};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::tile::Tile;
 use super::LayoutElement;
-use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -18,7 +17,6 @@ use crate::utils::{
 pub struct TabIndicator {
     shader_locs: Vec<Point<f64, Logical>>,
     shaders: Vec<BorderRenderElement>,
-    open_anim: Option<Animation>,
     config: niri_config::TabIndicator,
 }
 
@@ -41,7 +39,6 @@ impl TabIndicator {
         Self {
             shader_locs: Vec::new(),
             shaders: Vec::new(),
-            open_anim: None,
             config,
         }
     }
@@ -56,22 +53,6 @@ impl TabIndicator {
         }
     }
 
-    pub fn advance_animations(&mut self) {
-        if let Some(anim) = &mut self.open_anim {
-            if anim.is_done() {
-                self.open_anim = None;
-            }
-        }
-    }
-
-    pub fn are_animations_ongoing(&self) -> bool {
-        self.open_anim.is_some()
-    }
-
-    pub fn start_open_animation(&mut self, clock: Clock, config: niri_config::Animation) {
-        self.open_anim = Some(Animation::new(clock, 0., 1., 0., config));
-    }
-
     fn tab_rects(
         &self,
         area: Rectangle<f64, Logical>,
@@ -81,12 +62,10 @@ impl TabIndicator {
         let round = |logical: f64| round_logical_in_physical(scale, logical);
         let round_max1 = |logical: f64| round_logical_in_physical_max1(scale, logical);
 
-        let progress = self.open_anim.as_ref().map_or(1., |a| a.value().max(0.));
-
         let width = round_max1(self.config.width);
         let gap = self.config.gap;
         let gap = round_max1(gap.abs()).copysign(gap);
-        let gaps_between = round_max1(self.config.gaps_between_tabs);
+        let gaps_between = round(self.config.gaps_between_tabs);
 
         let position = self.config.position;
         let side = match position {
@@ -96,15 +75,10 @@ impl TabIndicator {
         let total_prop = self.config.length.total_proportion.unwrap_or(0.5);
         let min_length = round(side * total_prop.clamp(0., 2.));
 
-        // Compute px_per_tab before applying the animation to gaps_between in order to avoid it
-        // growing and shrinking over the duration of the animation.
         let pixel = 1. / scale;
         let shortest_length = count as f64 * (pixel + gaps_between) - gaps_between;
         let length = f64::max(min_length, shortest_length);
         let px_per_tab = (length + gaps_between) / count as f64 - gaps_between;
-
-        let px_per_tab = px_per_tab * progress;
-        let gaps_between = round(self.config.gaps_between_tabs * progress);
 
         let length = count as f64 * (px_per_tab + gaps_between) - gaps_between;
         let px_per_tab = floor_logical_in_physical_max1(scale, px_per_tab);
@@ -184,11 +158,6 @@ impl TabIndicator {
         self.shaders.resize_with(count, Default::default);
         self.shader_locs.resize_with(count, Default::default);
 
-        let position = self.config.position;
-        let radius = self.config.corner_radius as f32;
-        let shared_rounded_corners = self.config.gaps_between_tabs == 0.;
-        let mut tabs_left = tab_count;
-
         let rects = self.tab_rects(area, count, scale);
         for ((shader, loc), (tab, rect)) in zip(
             zip(&mut self.shaders, &mut self.shader_locs),
@@ -209,50 +178,6 @@ impl TabIndicator {
                 color_to *= 0.5;
             }
 
-            let radius = if shared_rounded_corners && tab_count > 1 {
-                if tabs_left == tab_count {
-                    // First tab.
-                    match position {
-                        TabIndicatorPosition::Left | TabIndicatorPosition::Right => CornerRadius {
-                            top_left: radius,
-                            top_right: radius,
-                            bottom_right: 0.,
-                            bottom_left: 0.,
-                        },
-                        TabIndicatorPosition::Top | TabIndicatorPosition::Bottom => CornerRadius {
-                            top_left: radius,
-                            top_right: 0.,
-                            bottom_right: 0.,
-                            bottom_left: radius,
-                        },
-                    }
-                } else if tabs_left == 1 {
-                    // Last tab.
-                    match position {
-                        TabIndicatorPosition::Left | TabIndicatorPosition::Right => CornerRadius {
-                            top_left: 0.,
-                            top_right: 0.,
-                            bottom_right: radius,
-                            bottom_left: radius,
-                        },
-                        TabIndicatorPosition::Top | TabIndicatorPosition::Bottom => CornerRadius {
-                            top_left: 0.,
-                            top_right: radius,
-                            bottom_right: radius,
-                            bottom_left: 0.,
-                        },
-                    }
-                } else {
-                    // Tab in the middle.
-                    CornerRadius::default()
-                }
-            } else {
-                // Separate tabs, or the only tab.
-                CornerRadius::from(radius)
-            };
-            let radius = radius.fit_to(rect.size.w as f32, rect.size.h as f32);
-            tabs_left -= 1;
-
             shader.update(
                 rect.size,
                 gradient_area,
@@ -262,7 +187,6 @@ impl TabIndicator {
                 ((tab.gradient.angle as f32) - 90.).to_radians(),
                 Rectangle::from_size(rect.size),
                 0.,
-                radius,
                 scale as f32,
                 1.,
             );
@@ -405,7 +329,7 @@ impl TabInfo {
             .or_else(gradient_from_config)
             .unwrap_or_else(gradient_from_border);
 
-        let geometry = Rectangle::new(position, tile.animated_tile_size());
+        let geometry = Rectangle::new(position, tile.tile_size());
 
         TabInfo { gradient, geometry }
     }

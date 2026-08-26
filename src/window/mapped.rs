@@ -1,7 +1,7 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::time::Duration;
 
-use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
+use niri_config::{Config, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -25,20 +25,19 @@ use super::{ResolvedWindowRules, WindowRef};
 use crate::handlers::KdeDecorationsModeState;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
-    LayoutElementRenderSnapshot, SizingMode,
+    SizingMode,
 };
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::{
-    push_elements_from_surface_tree, render_snapshot_from_surface_tree,
+    push_elements_from_surface_tree,
 };
 use crate::render_helpers::xray::XrayPos;
-use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
+use crate::render_helpers::{background_effect, RenderCtx, RenderTarget};
 use crate::utils::id::IdCounter;
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -108,15 +107,6 @@ pub struct Mapped {
 
     /// The blur config, passed for background effect rendering.
     blur_config: niri_config::Blur,
-
-    /// Whether the next configure should be animated, if the configured state changed.
-    animate_next_configure: bool,
-
-    /// Serials of commits that should be animated.
-    animate_serials: Vec<Serial>,
-
-    /// Snapshot right before an animated commit, without popups.
-    animation_snapshot: Option<LayoutElementRenderSnapshot>,
 
     /// State for the logic to request a size once (for floating windows).
     request_size_once: Option<RequestSizeOnce>,
@@ -293,9 +283,6 @@ impl Mapped {
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
             blur_config: config.blur,
-            animate_next_configure: false,
-            animate_serials: Vec::new(),
-            animation_snapshot: None,
             request_size_once: None,
             transaction_for_next_configure: None,
             pending_transactions: Vec::new(),
@@ -406,55 +393,28 @@ impl Mapped {
         self.need_to_recompute_rules = true;
     }
 
-    /// Renders a snapshot of the window without popups.
-    fn render_snapshot(&self, renderer: &mut GlesRenderer) -> LayoutElementRenderSnapshot {
-        let _span = tracy_client::span!("Mapped::render_snapshot");
+    pub fn render_for_screen_cast<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        scale: Scale<f64>,
+        push: &mut dyn FnMut(WindowCastRenderElements<R>),
+    ) {
+        let bbox = self.window.bbox_with_popups().to_physical_precise_up(scale);
 
-        let size = self.size().to_f64();
+        let location = self.window.geometry().loc.to_f64() - bbox.loc.to_logical(scale);
 
-        let mut buffer = self.block_out_buffer.borrow_mut();
-        buffer.resize(size);
-        let blocked_out_contents = vec![BakedBuffer {
-            buffer: buffer.clone(),
-            location: Point::from((0., 0.)),
-            src: None,
-            dst: None,
-        }];
-
-        let buf_pos = self.window.geometry().loc.upscale(-1).to_f64();
-
-        let mut contents = vec![];
-
-        let surface = self.toplevel().wl_surface();
-        render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
-
-        RenderSnapshot {
-            contents,
-            contents_with_blocked_out_bg: None,
-            blocked_out_contents,
-            block_out_from: self.rules().block_out_from,
-            size,
-            texture: Default::default(),
-            texture_with_blocked_out_bg: Default::default(),
-            blocked_out_texture: Default::default(),
-        }
-    }
-
-    pub fn should_animate_commit(&mut self, commit_serial: Serial) -> bool {
-        let mut should_animate = false;
-        self.animate_serials.retain_mut(|serial| {
-            if commit_serial.is_no_older_than(serial) {
-                should_animate = true;
-                false
-            } else {
-                true
-            }
-        });
-        should_animate
-    }
-
-    pub fn store_animation_snapshot(&mut self, renderer: &mut GlesRenderer) {
-        self.animation_snapshot = Some(self.render_snapshot(renderer));
+        self.render(
+            RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                xray: None,
+            },
+            location,
+            scale,
+            1.,
+            XrayPos::default(),
+            &mut |elem| push(WindowCastRenderElements::from(elem)),
+        );
     }
 
     pub fn take_pending_transaction(&mut self, commit_serial: Serial) -> Option<Transaction> {
@@ -493,68 +453,6 @@ impl Mapped {
 
     pub fn last_interactive_resize_start(&self) -> &Cell<Option<(Duration, ResizeEdge)>> {
         &self.last_interactive_resize_start
-    }
-
-    pub fn render_for_screen_cast<R: NiriRenderer>(
-        &self,
-        renderer: &mut R,
-        scale: Scale<f64>,
-        push: &mut dyn FnMut(WindowCastRenderElements<R>),
-    ) {
-        let bbox = self.window.bbox_with_popups().to_physical_precise_up(scale);
-
-        let has_border_shader = BorderRenderElement::has_shader(renderer);
-        let radius = self.geometry_corner_radius();
-        let window_size = self
-            .size()
-            .to_f64()
-            .to_physical_precise_round(scale)
-            .to_logical(scale);
-        let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
-        let location = self.window.geometry().loc.to_f64() - bbox.loc.to_logical(scale);
-
-        let use_border = |elem| {
-            if let LayoutElementRenderElement::SolidColor(elem) = &elem {
-                // In this branch we're rendering a blocked-out window with a solid color. We need
-                // to render it with a rounded corner shader even if clip_to_geometry is false,
-                // because in this case we're assuming that the unclipped window CSD already has
-                // corners rounded to the user-provided radius, so our blocked-out rendering should
-                // match that radius.
-                if radius != CornerRadius::default() && has_border_shader {
-                    let geo = elem.geo();
-                    return BorderRenderElement::new(
-                        geo.size,
-                        Rectangle::from_size(geo.size),
-                        GradientInterpolation::default(),
-                        Color::from_color32f(elem.color()),
-                        Color::from_color32f(elem.color()),
-                        0.,
-                        Rectangle::from_size(geo.size),
-                        0.,
-                        radius,
-                        scale.x as f32,
-                        1.,
-                    )
-                    .with_location(geo.loc)
-                    .into();
-                }
-            }
-
-            WindowCastRenderElements::from(elem)
-        };
-
-        self.render(
-            RenderCtx {
-                renderer,
-                target: RenderTarget::Screencast,
-                xray: None,
-            },
-            location,
-            scale,
-            1.,
-            XrayPos::default(),
-            &mut |elem| push(use_border(elem)),
-        );
     }
 
     pub fn get_focus_timestamp(&self) -> Option<Duration> {
@@ -711,7 +609,6 @@ impl LayoutElement for Mapped {
 
             let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
             let surface_off = popup_geo.loc.upscale(-1).to_f64();
-            let surface_anim_scale = Scale::from(1.);
             let mut effect = popup_rules.background_effect;
             // Default xray to false for pop-ups since they're always on top of something.
             if effect.xray.is_none() {
@@ -726,9 +623,7 @@ impl LayoutElement for Mapped {
                 false,
                 surface,
                 surface_off,
-                surface_anim_scale,
                 self.blur_config,
-                popup_rules.geometry_corner_radius.unwrap_or_default(),
                 effect,
                 false,
                 xray_pos,
@@ -743,8 +638,6 @@ impl LayoutElement for Mapped {
         geometry: Rectangle<f64, Logical>,
         scale: f64,
         clip_to_geometry: bool,
-        surface_anim_scale: Scale<f64>,
-        radius: CornerRadius,
         xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
@@ -757,9 +650,7 @@ impl LayoutElement for Mapped {
             clip_to_geometry,
             self.toplevel().wl_surface(),
             self.buf_loc().to_f64(),
-            surface_anim_scale,
             self.blur_config,
-            radius,
             self.rules.background_effect,
             should_block_out,
             xray_pos,
@@ -771,7 +662,7 @@ impl LayoutElement for Mapped {
         &mut self,
         size: Size<i32, Logical>,
         mode: SizingMode,
-        animate: bool,
+        _animate: bool,
         transaction: Option<Transaction>,
     ) {
         // Going into real fullscreen resets windowed fullscreen.
@@ -791,7 +682,7 @@ impl LayoutElement for Mapped {
             self.needs_configure = true;
         }
 
-        let changed = self.toplevel().with_pending_state(|state| {
+        let _changed = self.toplevel().with_pending_state(|state| {
             let changed = state.size != Some(size);
             state.size = Some(size);
 
@@ -809,9 +700,7 @@ impl LayoutElement for Mapped {
             changed
         });
 
-        if changed && animate {
-            self.animate_next_configure = true;
-        }
+
 
         self.request_size_once = None;
 
@@ -825,7 +714,7 @@ impl LayoutElement for Mapped {
         }
     }
 
-    fn request_size_once(&mut self, size: Size<i32, Logical>, animate: bool) {
+    fn request_size_once(&mut self, size: Size<i32, Logical>, _animate: bool) {
         // Assume that when calling this function, the window is going floating, so it can no
         // longer participate in any transactions with other windows.
         self.transaction_for_next_configure = None;
@@ -880,7 +769,7 @@ impl LayoutElement for Mapped {
             return;
         }
 
-        let changed = self.toplevel().with_pending_state(|state| {
+        let _changed = self.toplevel().with_pending_state(|state| {
             let changed = state.size != Some(size);
             state.size = Some(size);
             if !self.is_pending_windowed_fullscreen {
@@ -890,9 +779,7 @@ impl LayoutElement for Mapped {
             changed
         });
 
-        if changed && animate {
-            self.animate_next_configure = true;
-        }
+
 
         self.request_size_once = Some(RequestSizeOnce::WaitingForConfigure);
     }
@@ -1112,9 +999,6 @@ impl LayoutElement for Mapped {
             // hidden ones.
             self.needs_frame_callback = true;
 
-            if self.animate_next_configure {
-                self.animate_serials.push(serial);
-            }
 
             if let Some(transaction) = self.transaction_for_next_configure.take() {
                 self.pending_transactions.push((serial, transaction));
@@ -1163,7 +1047,6 @@ impl LayoutElement for Mapped {
             };
         }
 
-        self.animate_next_configure = false;
         self.transaction_for_next_configure = None;
     }
 
@@ -1356,10 +1239,6 @@ impl LayoutElement for Mapped {
 
     fn rules(&self) -> &ResolvedWindowRules {
         &self.rules
-    }
-
-    fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {
-        self.animation_snapshot.take()
     }
 
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>) {

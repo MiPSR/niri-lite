@@ -161,18 +161,6 @@ impl Winit {
         resources::init(renderer);
         shaders::init(renderer);
 
-        let config = self.config.borrow();
-        if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
-            shaders::set_custom_resize_program(renderer, Some(src));
-        }
-        if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
-            shaders::set_custom_close_program(renderer, Some(src));
-        }
-        if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
-            shaders::set_custom_open_program(renderer, Some(src));
-        }
-        drop(config);
-
         niri.update_shaders();
 
         self.create_dmabuf_global(niri);

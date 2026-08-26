@@ -139,7 +139,7 @@ impl State {
         let _span = tracy_client::span!("process_input_event");
 
         // Make sure some logic like workspace clean-up has a chance to run before doing actions.
-        self.niri.advance_animations();
+        self.niri.update();
 
         if self.niri.monitors_active {
             // Notify the idle-notifier of activity.
@@ -5274,7 +5274,6 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::animation::Clock;
 
     #[test]
     fn bindings_suppress_keys() {
@@ -5295,7 +5294,7 @@ mod tests {
         let comp_mod = ModKey::Super;
         let mut suppressed_keys = HashSet::new();
 
-        let screenshot_ui = ScreenshotUi::new(Clock::default(), Default::default());
+        let screenshot_ui = ScreenshotUi::new();
         let disable_power_key_handling = false;
         let is_inhibiting_shortcuts = Cell::new(false);
 

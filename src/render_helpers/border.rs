@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
-use niri_config::{
-    Color, CornerRadius, GradientColorSpace, GradientInterpolation, HueInterpolation,
-};
+use niri_config::{Color, GradientColorSpace, GradientInterpolation, HueInterpolation};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
@@ -40,7 +38,6 @@ struct Parameters {
     angle: f32,
     geometry: Rectangle<f64, Logical>,
     border_width: f32,
-    corner_radius: CornerRadius,
     // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
     scale: f32,
     alpha: f32,
@@ -57,7 +54,6 @@ impl BorderRenderElement {
         angle: f32,
         geometry: Rectangle<f64, Logical>,
         border_width: f32,
-        corner_radius: CornerRadius,
         scale: f32,
         alpha: f32,
     ) -> Self {
@@ -73,7 +69,6 @@ impl BorderRenderElement {
                 angle,
                 geometry,
                 border_width,
-                corner_radius,
                 scale,
                 alpha,
             },
@@ -95,7 +90,6 @@ impl BorderRenderElement {
                 angle: 0.,
                 geometry: Default::default(),
                 border_width: 0.,
-                corner_radius: Default::default(),
                 scale: 1.,
                 alpha: 1.,
             },
@@ -117,7 +111,6 @@ impl BorderRenderElement {
         angle: f32,
         geometry: Rectangle<f64, Logical>,
         border_width: f32,
-        corner_radius: CornerRadius,
         scale: f32,
         alpha: f32,
     ) {
@@ -130,7 +123,6 @@ impl BorderRenderElement {
             angle,
             geometry,
             border_width,
-            corner_radius,
             scale,
             alpha,
         };
@@ -152,7 +144,6 @@ impl BorderRenderElement {
             angle,
             geometry,
             border_width,
-            corner_radius,
             scale,
             alpha,
         } = self.params;
@@ -211,7 +202,6 @@ impl BorderRenderElement {
                 Uniform::new("grad_vec", grad_vec.to_array()),
                 mat3_uniform("input_to_geo", input_to_geo),
                 Uniform::new("geo_size", geo_size.to_array()),
-                Uniform::new("outer_radius", <[f32; 4]>::from(corner_radius)),
                 Uniform::new("border_width", border_width),
             ]),
             HashMap::new(),

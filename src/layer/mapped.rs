@@ -8,7 +8,7 @@ use smithay::wayland::compositor::{remove_pre_commit_hook, HookId};
 use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
 
 use super::ResolvedLayerRules;
-use crate::animation::Clock;
+use crate::clock::Clock;
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
@@ -120,13 +120,11 @@ impl MappedLayer {
 
         self.block_out_buffer.resize(size);
 
-        let radius = self.rules.geometry_corner_radius.unwrap_or_default();
         // FIXME: is_active based on keyboard focus?
-        self.shadow
-            .update_render_elements(size, true, radius, self.scale, 1.);
+        self.shadow.update_render_elements(size, true, self.scale, 1.);
     }
 
-    pub fn are_animations_ongoing(&self) -> bool {
+    pub fn needs_update(&self) -> bool {
         self.rules.baba_is_float
     }
 
@@ -235,8 +233,6 @@ impl MappedLayer {
 
         let geometry = Rectangle::new(location, self.block_out_buffer.size());
         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
-        let surface_anim_scale = Scale::from(1.);
-        let radius = self.rules.geometry_corner_radius.unwrap_or_default();
         background_effect::render_for_tile(
             ctx.as_gles(),
             ns,
@@ -245,9 +241,7 @@ impl MappedLayer {
             false,
             surface,
             surface_off,
-            surface_anim_scale,
             self.blur_config,
-            radius,
             self.rules.background_effect,
             should_block_out,
             xray_pos,
@@ -299,7 +293,6 @@ impl MappedLayer {
 
             let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
             let surface_off = popup_geo.loc.upscale(-1).to_f64();
-            let surface_anim_scale = Scale::from(1.);
             let mut effect = popup_rules.background_effect;
             // Default xray to false for pop-ups since they're always on top of something.
             if effect.xray.is_none() {
@@ -314,9 +307,7 @@ impl MappedLayer {
                 false,
                 surface,
                 surface_off,
-                surface_anim_scale,
                 self.blur_config,
-                popup_rules.geometry_corner_radius.unwrap_or_default(),
                 effect,
                 false,
                 xray_pos,

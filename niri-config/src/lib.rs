@@ -28,7 +28,6 @@ use miette::{miette, Context as _, IntoDiagnostic as _};
 #[macro_use]
 pub mod macros;
 
-pub mod animations;
 pub mod appearance;
 pub mod binds;
 pub mod debug;
@@ -44,7 +43,6 @@ pub mod utils;
 pub mod window_rule;
 pub mod workspace;
 
-pub use crate::animations::{Animation, Animations};
 pub use crate::appearance::*;
 pub use crate::binds::*;
 pub use crate::debug::Debug;
@@ -79,7 +77,6 @@ pub struct Config {
     pub clipboard: Clipboard,
     pub hotkey_overlay: HotkeyOverlay,
     pub config_notification: ConfigNotification,
-    pub animations: Animations,
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
@@ -196,7 +193,6 @@ where
                 "clipboard" => m_merge!(clipboard),
                 "hotkey-overlay" => m_merge!(hotkey_overlay),
                 "config-notification" => m_merge!(config_notification),
-                "animations" => m_merge!(animations),
                 "blur" => m_merge!(blur),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
@@ -867,28 +863,6 @@ mod tests {
                 skip-at-startup
             }
 
-            animations {
-                slowdown 2.0
-
-                workspace-switch {
-                    spring damping-ratio=1.0 stiffness=1000 epsilon=0.0001
-                }
-
-                horizontal-view-movement {
-                    duration-ms 100
-                    curve "ease-out-expo"
-                }
-
-                window-open { off; }
-
-                window-close {
-                    curve "cubic-bezier" 0.05 0.7 0.1 1
-                }
-
-                recent-windows-close {
-                    off
-                }
-            }
 
             gestures {
                 dnd-edge-view-scroll {
@@ -1409,7 +1383,6 @@ mod tests {
                     },
                     position: Top,
                     gaps_between_tabs: 0.0,
-                    corner_radius: 0.0,
                     active_color: None,
                     inactive_color: None,
                     urgent_color: None,
@@ -1530,146 +1503,6 @@ mod tests {
             },
             config_notification: ConfigNotification {
                 disable_failed: false,
-            },
-            animations: Animations {
-                off: false,
-                slowdown: 2.0,
-                workspace_switch: WorkspaceSwitchAnim(
-                    Animation {
-                        off: false,
-                        kind: Spring(
-                            SpringParams {
-                                damping_ratio: 1.0,
-                                stiffness: 1000,
-                                epsilon: 0.0001,
-                            },
-                        ),
-                    },
-                ),
-                window_open: WindowOpenAnim {
-                    anim: Animation {
-                        off: true,
-                        kind: Easing(
-                            EasingParams {
-                                duration_ms: 150,
-                                curve: EaseOutExpo,
-                            },
-                        ),
-                    },
-                    custom_shader: None,
-                },
-                window_close: WindowCloseAnim {
-                    anim: Animation {
-                        off: false,
-                        kind: Easing(
-                            EasingParams {
-                                duration_ms: 150,
-                                curve: CubicBezier(
-                                    0.05,
-                                    0.7,
-                                    0.1,
-                                    1.0,
-                                ),
-                            },
-                        ),
-                    },
-                    custom_shader: None,
-                },
-                horizontal_view_movement: HorizontalViewMovementAnim(
-                    Animation {
-                        off: false,
-                        kind: Easing(
-                            EasingParams {
-                                duration_ms: 100,
-                                curve: EaseOutExpo,
-                            },
-                        ),
-                    },
-                ),
-                window_movement: WindowMovementAnim(
-                    Animation {
-                        off: false,
-                        kind: Spring(
-                            SpringParams {
-                                damping_ratio: 1.0,
-                                stiffness: 800,
-                                epsilon: 0.0001,
-                            },
-                        ),
-                    },
-                ),
-                window_resize: WindowResizeAnim {
-                    anim: Animation {
-                        off: false,
-                        kind: Spring(
-                            SpringParams {
-                                damping_ratio: 1.0,
-                                stiffness: 800,
-                                epsilon: 0.0001,
-                            },
-                        ),
-                    },
-                    custom_shader: None,
-                },
-                config_notification_open_close: ConfigNotificationOpenCloseAnim(
-                    Animation {
-                        off: false,
-                        kind: Spring(
-                            SpringParams {
-                                damping_ratio: 0.6,
-                                stiffness: 1000,
-                                epsilon: 0.001,
-                            },
-                        ),
-                    },
-                ),
-                exit_confirmation_open_close: ExitConfirmationOpenCloseAnim(
-                    Animation {
-                        off: false,
-                        kind: Spring(
-                            SpringParams {
-                                damping_ratio: 0.6,
-                                stiffness: 500,
-                                epsilon: 0.01,
-                            },
-                        ),
-                    },
-                ),
-                screenshot_ui_open: ScreenshotUiOpenAnim(
-                    Animation {
-                        off: false,
-                        kind: Easing(
-                            EasingParams {
-                                duration_ms: 200,
-                                curve: EaseOutQuad,
-                            },
-                        ),
-                    },
-                ),
-                overview_open_close: OverviewOpenCloseAnim(
-                    Animation {
-                        off: false,
-                        kind: Spring(
-                            SpringParams {
-                                damping_ratio: 1.0,
-                                stiffness: 800,
-                                epsilon: 0.0001,
-                            },
-                        ),
-                    },
-                ),
-                recent_windows_close: RecentWindowsCloseAnim(
-                    Animation {
-                        off: true,
-                        kind: Spring(
-                            SpringParams {
-                                damping_ratio: 1.0,
-                                stiffness: 800,
-                                epsilon: 0.001,
-                            },
-                        ),
-                    },
-                ),
             },
             blur: Blur {
                 off: false,
@@ -1889,7 +1722,6 @@ mod tests {
                     },
                     draw_border_with_background: None,
                     opacity: None,
-                    geometry_corner_radius: None,
                     clip_to_geometry: None,
                     baba_is_float: None,
                     block_out_from: None,
@@ -1918,7 +1750,6 @@ mod tests {
                     },
                     popups: PopupsRule {
                         opacity: None,
-                        geometry_corner_radius: None,
                         background_effect: BackgroundEffectRule {
                             xray: None,
                             blur: None,
@@ -1958,7 +1789,6 @@ mod tests {
                         color: None,
                         inactive_color: None,
                     },
-                    geometry_corner_radius: None,
                     place_within_backdrop: None,
                     baba_is_float: None,
                     background_effect: BackgroundEffectRule {
@@ -1969,7 +1799,6 @@ mod tests {
                     },
                     popups: PopupsRule {
                         opacity: None,
-                        geometry_corner_radius: None,
                         background_effect: BackgroundEffectRule {
                             xray: None,
                             blur: None,
@@ -2344,7 +2173,6 @@ mod tests {
                         a: 1.0,
                     },
                     padding: 15.0,
-                    corner_radius: 0.0,
                 },
                 previews: MruPreviews {
                     max_height: 960.0,

@@ -1,4 +1,4 @@
-use crate::appearance::{BackgroundEffectRule, BlockOutFrom, CornerRadius, ShadowRule};
+use crate::appearance::{BackgroundEffectRule, BlockOutFrom, ShadowRule};
 use crate::utils::RegexEq;
 use crate::window_rule::PopupsRule;
 
@@ -15,8 +15,6 @@ pub struct LayerRule {
     pub block_out_from: Option<BlockOutFrom>,
     #[knuffel(child, default)]
     pub shadow: ShadowRule,
-    #[knuffel(child)]
-    pub geometry_corner_radius: Option<CornerRadius>,
     #[knuffel(child, unwrap(argument))]
     pub place_within_backdrop: Option<bool>,
     #[knuffel(child, unwrap(argument))]

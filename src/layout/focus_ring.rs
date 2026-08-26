@@ -1,6 +1,6 @@
 use std::iter::zip;
 
-use niri_config::{CornerRadius, Gradient, GradientRelativeTo};
+use niri_config::{Gradient, GradientRelativeTo};
 use smithay::backend::renderer::element::{Element as _, Kind};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -19,7 +19,6 @@ pub struct FocusRing {
     is_border: bool,
     use_border_shader: bool,
     config: niri_config::FocusRing,
-    thicken_corners: bool,
 }
 
 niri_render_elements! {
@@ -40,7 +39,6 @@ impl FocusRing {
             is_border: false,
             use_border_shader: false,
             config,
-            thicken_corners: true,
         }
     }
 
@@ -62,7 +60,6 @@ impl FocusRing {
         is_border: bool,
         is_urgent: bool,
         view_rect: Rectangle<f64, Logical>,
-        radius: CornerRadius,
         scale: f64,
         alpha: f32,
     ) {
@@ -82,8 +79,6 @@ impl FocusRing {
             buf.set_color(color);
         }
 
-        let radius = radius.fit_to(self.full_size.w as f32, self.full_size.h as f32);
-
         let gradient = if is_urgent {
             self.config.urgent_gradient
         } else if is_active {
@@ -92,7 +87,7 @@ impl FocusRing {
             self.config.inactive_gradient
         };
 
-        self.use_border_shader = radius != CornerRadius::default() || gradient.is_some();
+        self.use_border_shader = gradient.is_some();
 
         // Set the defaults for solid color + rounded corners.
         let gradient = gradient.unwrap_or_else(|| Gradient::from(color));
@@ -103,77 +98,53 @@ impl FocusRing {
             GradientRelativeTo::WorkspaceView => view_rect,
         };
 
-        let rounded_corner_border_width = if is_border {
-            // HACK: increase the border width used for the inner rounded corners a tiny bit to
-            // reduce background bleed.
-            let extra = if self.thicken_corners { 0.5 } else { 0. };
-            width as f32 + extra
-        } else {
-            0.
-        };
+        let border_width = if is_border { width as f32 } else { 0. };
 
         let ceil = |logical: f64| (logical * scale).ceil() / scale;
 
         // All of this stuff should end up aligned to physical pixels because:
         // * Window size and border width are rounded to physical pixels before being passed to this
         //   function.
-        // * We will ceil the corner radii below.
         // * We do not divide anything, only add, subtract and multiply by integers.
         // * At rendering time, tile positions are rounded to physical pixels.
 
         if is_border {
-            let top_left = f64::max(width, ceil(f64::from(radius.top_left)));
-            let top_right = f64::min(
-                self.full_size.w - top_left,
-                f64::max(width, ceil(f64::from(radius.top_right))),
-            );
-            let bottom_left = f64::min(
-                self.full_size.h - top_left,
-                f64::max(width, ceil(f64::from(radius.bottom_left))),
-            );
-            let bottom_right = f64::min(
-                self.full_size.h - top_right,
-                f64::min(
-                    self.full_size.w - bottom_left,
-                    f64::max(width, ceil(f64::from(radius.bottom_right))),
-                ),
-            );
+            let corner = ceil(width);
 
             // Top edge.
-            self.sizes[0] = Size::from((win_size.w + width * 2. - top_left - top_right, width));
-            self.locations[0] = Point::from((-width + top_left, -width));
+            self.sizes[0] = Size::from((win_size.w + width * 2. - corner - corner, width));
+            self.locations[0] = Point::from((-width + corner, -width));
 
             // Bottom edge.
-            self.sizes[1] =
-                Size::from((win_size.w + width * 2. - bottom_left - bottom_right, width));
-            self.locations[1] = Point::from((-width + bottom_left, win_size.h));
+            self.sizes[1] = Size::from((win_size.w + width * 2. - corner - corner, width));
+            self.locations[1] = Point::from((-width + corner, win_size.h));
 
             // Left edge.
-            self.sizes[2] = Size::from((width, win_size.h + width * 2. - top_left - bottom_left));
-            self.locations[2] = Point::from((-width, -width + top_left));
+            self.sizes[2] = Size::from((width, win_size.h + width * 2. - corner - corner));
+            self.locations[2] = Point::from((-width, -width + corner));
 
             // Right edge.
-            self.sizes[3] = Size::from((width, win_size.h + width * 2. - top_right - bottom_right));
-            self.locations[3] = Point::from((win_size.w, -width + top_right));
+            self.sizes[3] = Size::from((width, win_size.h + width * 2. - corner - corner));
+            self.locations[3] = Point::from((win_size.w, -width + corner));
 
             // Top-left corner.
-            self.sizes[4] = Size::from((top_left, top_left));
+            self.sizes[4] = Size::from((corner, corner));
             self.locations[4] = Point::from((-width, -width));
 
             // Top-right corner.
-            self.sizes[5] = Size::from((top_right, top_right));
-            self.locations[5] = Point::from((win_size.w + width - top_right, -width));
+            self.sizes[5] = Size::from((corner, corner));
+            self.locations[5] = Point::from((win_size.w + width - corner, -width));
 
             // Bottom-right corner.
-            self.sizes[6] = Size::from((bottom_right, bottom_right));
+            self.sizes[6] = Size::from((corner, corner));
             self.locations[6] = Point::from((
-                win_size.w + width - bottom_right,
-                win_size.h + width - bottom_right,
+                win_size.w + width - corner,
+                win_size.h + width - corner,
             ));
 
             // Bottom-left corner.
-            self.sizes[7] = Size::from((bottom_left, bottom_left));
-            self.locations[7] = Point::from((-width, win_size.h + width - bottom_left));
+            self.sizes[7] = Size::from((corner, corner));
+            self.locations[7] = Point::from((-width, win_size.h + width - corner));
 
             for (buf, size) in zip(&mut self.buffers, self.sizes) {
                 buf.resize(size);
@@ -188,8 +159,7 @@ impl FocusRing {
                     gradient.to,
                     ((gradient.angle as f32) - 90.).to_radians(),
                     Rectangle::new(full_rect.loc - loc, full_rect.size),
-                    rounded_corner_border_width,
-                    radius,
+                    border_width,
                     scale as f32,
                     alpha,
                 );
@@ -207,8 +177,7 @@ impl FocusRing {
                 gradient.to,
                 ((gradient.angle as f32) - 90.).to_radians(),
                 Rectangle::new(full_rect.loc - self.locations[0], full_rect.size),
-                rounded_corner_border_width,
-                radius,
+                border_width,
                 scale as f32,
                 alpha,
             );
@@ -264,10 +233,6 @@ impl FocusRing {
 
     pub fn is_off(&self) -> bool {
         self.config.off
-    }
-
-    pub fn set_thicken_corners(&mut self, value: bool) {
-        self.thicken_corners = value;
     }
 
     pub fn config(&self) -> &niri_config::FocusRing {

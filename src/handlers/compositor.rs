@@ -234,8 +234,6 @@ impl CompositorHandler for State {
                     }
 
                     if let Some(output) = output {
-                        self.niri.layout.start_open_animation_for_window(&window);
-
                         let new_focus = self.niri.layout.focus().map(|m| &m.window);
                         if new_focus == Some(&window) {
                             // We activated the newly opened window.
@@ -268,17 +266,6 @@ impl CompositorHandler for State {
                 // This is a commit of a previously-mapped toplevel.
                 let is_mapped = is_mapped(surface);
 
-                // Must start the close animation before window.on_commit().
-                let transaction = Transaction::new();
-                if !is_mapped {
-                    let blocker = transaction.blocker();
-                    self.backend.with_primary_renderer(|renderer| {
-                        self.niri
-                            .layout
-                            .start_close_animation_for_window(renderer, &window, blocker);
-                    });
-                }
-
                 window.on_commit();
 
                 if !is_mapped {
@@ -293,6 +280,7 @@ impl CompositorHandler for State {
                     self.niri
                         .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
+                    let transaction = Transaction::new();
                     self.niri.window_mru_ui.remove_window(id);
                     self.niri.layout.remove_window(&window, transaction.clone());
                     self.add_default_dmabuf_pre_commit_hook(surface);
@@ -480,23 +468,6 @@ impl CompositorHandler for State {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
-        // Clients may destroy their subsurfaces before the main surface. Ensure we have a snapshot
-        // when that happens, so that the closing animation includes all these subsurfaces.
-        //
-        // Test client: alacritty with CSD <= 0.13 (it was fixed in winit afterwards:
-        // https://github.com/rust-windowing/winit/pull/3625).
-        //
-        // This is still not perfect, as this function is called already after the (first)
-        // subsurface is destroyed; in the case of alacritty, this is the top CSD shadow. But, it
-        // gets most of the job done.
-        if let Some(root) = self.niri.root_surface.get(surface) {
-            if let Some((mapped, output)) = self.niri.layout.find_window_and_output(root) {
-                let window = mapped.window.clone();
-                let output = output.cloned();
-                self.store_unmap_snapshot(&window, output.as_ref());
-            }
-        }
-
         self.niri
             .root_surface
             .retain(|k, v| k != surface && v != surface);

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
-use niri_config::{Color, CornerRadius};
+use niri_config::Color;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
@@ -29,13 +29,11 @@ struct Parameters {
     geometry: Rectangle<f64, Logical>,
     color: Color,
     sigma: f32,
-    corner_radius: CornerRadius,
     // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
     scale: f32,
     alpha: f32,
 
     window_geometry: Rectangle<f64, Logical>,
-    window_corner_radius: CornerRadius,
 }
 
 impl ShadowRenderElement {
@@ -45,10 +43,8 @@ impl ShadowRenderElement {
         geometry: Rectangle<f64, Logical>,
         color: Color,
         sigma: f32,
-        corner_radius: CornerRadius,
         scale: f32,
         window_geometry: Rectangle<f64, Logical>,
-        window_corner_radius: CornerRadius,
         alpha: f32,
     ) -> Self {
         let inner = ShaderRenderElement::empty(ProgramType::Shadow, Kind::Unspecified);
@@ -59,11 +55,9 @@ impl ShadowRenderElement {
                 geometry,
                 color,
                 sigma,
-                corner_radius,
                 scale,
                 alpha,
                 window_geometry,
-                window_corner_radius,
             },
         };
         rv.update_inner();
@@ -79,11 +73,9 @@ impl ShadowRenderElement {
                 geometry: Default::default(),
                 color: Default::default(),
                 sigma: 0.,
-                corner_radius: Default::default(),
                 scale: 1.,
                 alpha: 1.,
                 window_geometry: Default::default(),
-                window_corner_radius: Default::default(),
             },
         }
     }
@@ -99,10 +91,8 @@ impl ShadowRenderElement {
         geometry: Rectangle<f64, Logical>,
         color: Color,
         sigma: f32,
-        corner_radius: CornerRadius,
         scale: f32,
         window_geometry: Rectangle<f64, Logical>,
-        window_corner_radius: CornerRadius,
         alpha: f32,
     ) {
         let params = Parameters {
@@ -111,10 +101,8 @@ impl ShadowRenderElement {
             color,
             sigma,
             alpha,
-            corner_radius,
             scale,
             window_geometry,
-            window_corner_radius,
         };
         if self.params == params {
             return;
@@ -131,10 +119,8 @@ impl ShadowRenderElement {
             color,
             sigma,
             alpha,
-            corner_radius,
             scale,
             window_geometry,
-            window_corner_radius,
         } = self.params;
 
         let area_size = Vec2::new(size.w as f32, size.h as f32);
@@ -162,13 +148,8 @@ impl ShadowRenderElement {
                 Uniform::new("sigma", sigma),
                 mat3_uniform("input_to_geo", input_to_geo),
                 Uniform::new("geo_size", geo_size.to_array()),
-                Uniform::new("corner_radius", <[f32; 4]>::from(corner_radius)),
                 mat3_uniform("window_input_to_geo", window_input_to_geo),
                 Uniform::new("window_geo_size", window_geo_size.to_array()),
-                Uniform::new(
-                    "window_corner_radius",
-                    <[f32; 4]>::from(window_corner_radius),
-                ),
             ]),
             HashMap::new(),
         );

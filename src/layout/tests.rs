@@ -1,4 +1,4 @@
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::Cell;
 
 use niri_config::utils::Flag;
 use niri_config::workspace::WorkspaceName;
@@ -13,7 +13,6 @@ use smithay::utils::Rectangle;
 
 use super::*;
 
-mod animations;
 mod fullscreen;
 
 impl<W: LayoutElement> Default for Layout<W> {
@@ -38,8 +37,6 @@ struct TestWindowInner {
     sizing_mode: Cell<SizingMode>,
     is_windowed_fullscreen: Cell<bool>,
     is_pending_windowed_fullscreen: Cell<bool>,
-    animate_next_configure: Cell<bool>,
-    animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
     rules: ResolvedWindowRules,
 }
 
@@ -90,8 +87,6 @@ impl TestWindow {
             sizing_mode: Cell::new(SizingMode::Normal),
             is_windowed_fullscreen: Cell::new(false),
             is_pending_windowed_fullscreen: Cell::new(false),
-            animate_next_configure: Cell::new(false),
-            animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
         }))
     }
@@ -113,25 +108,10 @@ impl TestWindow {
             }
 
             if self.0.bbox.get() != new_bbox {
-                if self.0.animate_next_configure.get() {
-                    self.0.animation_snapshot.replace(Some(RenderSnapshot {
-                        contents: Vec::new(),
-                        contents_with_blocked_out_bg: None,
-                        blocked_out_contents: Vec::new(),
-                        block_out_from: None,
-                        size: self.0.bbox.get().size.to_f64(),
-                        texture: OnceCell::new(),
-                        texture_with_blocked_out_bg: Default::default(),
-                        blocked_out_texture: OnceCell::new(),
-                    }));
-                }
-
                 self.0.bbox.set(new_bbox);
                 changed = true;
             }
         }
-
-        self.0.animate_next_configure.set(false);
 
         if self.0.sizing_mode.get() != self.0.pending_sizing_mode.get() {
             self.0.sizing_mode.set(self.0.pending_sizing_mode.get());
@@ -177,7 +157,6 @@ impl LayoutElement for TestWindow {
     ) {
         if self.0.requested_size.get() != Some(size) {
             self.0.requested_size.set(Some(size));
-            self.0.animate_next_configure.set(true);
         }
 
         self.0.pending_sizing_mode.set(mode);
@@ -263,10 +242,6 @@ impl LayoutElement for TestWindow {
 
     fn rules(&self) -> &ResolvedWindowRules {
         &self.0.rules
-    }
-
-    fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {
-        self.0.animation_snapshot.take()
     }
 
     fn set_interactive_resize(&mut self, _data: Option<InteractiveResizeData>) {}
@@ -1494,11 +1469,11 @@ impl Op {
                     now = now.saturating_sub(Duration::from_millis(-msec_delta as u64));
                 }
                 layout.clock.set_unadjusted(now);
-                layout.advance_animations();
+                layout.update();
             }
             Op::CompleteAnimations => {
                 layout.clock.set_complete_instantly(true);
-                layout.advance_animations();
+                layout.update();
                 layout.clock.set_complete_instantly(false);
             }
             Op::MoveWorkspaceToOutput(id) => {

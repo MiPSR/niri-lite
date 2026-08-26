@@ -85,7 +85,7 @@ impl Fixture {
     pub fn niri_complete_animations(&mut self) {
         let niri = self.niri();
         niri.clock.set_complete_instantly(true);
-        niri.advance_animations();
+        niri.update();
         niri.clock.set_complete_instantly(false);
     }
 

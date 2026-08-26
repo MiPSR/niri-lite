@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use niri_config::CornerRadius;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
@@ -21,11 +20,6 @@ pub struct BackgroundEffect {
     nonxray: FramebufferEffect,
     /// Damage when options change.
     damage: ExtraDamage,
-    /// Corner radius for clipping.
-    ///
-    /// Stored here in addition to `RenderParams` to damage when it changes.
-    // FIXME: would be good to remove this duplication of radius.
-    corner_radius: CornerRadius,
     blur_config: niri_config::Blur,
     options: Options,
 }
@@ -57,20 +51,9 @@ pub struct RenderParams {
     /// `subregion.iter()` should return `geometry`-relative rectangles.
     pub subregion: Option<TransformedRegion>,
     /// Geometry and radius for clipping in the same coordinate space as `geometry`.
-    pub clip: Option<(Rectangle<f64, Logical>, CornerRadius)>,
+    pub clip: Option<Rectangle<f64, Logical>>,
     /// Scale to use for rounding to physical pixels.
     pub scale: f64,
-}
-
-impl RenderParams {
-    fn fit_clip_radius(&mut self) {
-        if let Some((geo, radius)) = &mut self.clip {
-            // HACK: increase radius to avoid slight bleed on rounded corners.
-            *radius = radius.expanded_by(1.);
-
-            *radius = radius.fit_to(geo.size.w as f32, geo.size.h as f32);
-        }
-    }
 }
 
 niri_render_elements! {
@@ -86,7 +69,6 @@ impl BackgroundEffect {
         Self {
             nonxray: FramebufferEffect::new(),
             damage: ExtraDamage::new(),
-            corner_radius: CornerRadius::default(),
             blur_config: niri_config::Blur::default(),
             options: Options::default(),
         }
@@ -110,7 +92,6 @@ impl BackgroundEffect {
 
     pub fn update_render_elements(
         &mut self,
-        corner_radius: CornerRadius,
         effect: niri_config::BackgroundEffect,
         has_blur_region: bool,
     ) {
@@ -134,12 +115,11 @@ impl BackgroundEffect {
             options.xray = true;
         }
 
-        if self.options == options && self.corner_radius == corner_radius {
+        if self.options == options {
             return;
         }
 
         self.options = options;
-        self.corner_radius = corner_radius;
         self.damage.damage_all();
         self.nonxray.damage();
     }
@@ -152,18 +132,13 @@ impl BackgroundEffect {
         &self,
         ctx: RenderCtx<GlesRenderer>,
         ns: Option<usize>,
-        mut params: RenderParams,
+        params: RenderParams,
         xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
         if !self.is_visible() {
             return;
         }
-
-        if let Some(clip) = &mut params.clip {
-            clip.1 = self.corner_radius;
-        }
-        params.fit_clip_radius();
 
         let damage = self.damage.render(params.geometry);
 
@@ -212,7 +187,6 @@ fn render_params_for_tile(
     block_out: bool,
     blur_region: Option<Arc<Vec<Rectangle<i32, Logical>>>>,
     surface_geo: Rectangle<f64, Logical>,
-    surface_anim_scale: Scale<f64>,
 ) -> Option<RenderParams> {
     // Effects not requested by the surface itself are drawn to match the geometry.
     let mut clip = true;
@@ -233,12 +207,12 @@ fn render_params_for_tile(
             if block_out {
                 clip = true;
             } else {
-                let mut surface_geo = surface_geo.upscale(surface_anim_scale);
+                let mut surface_geo = surface_geo;
                 surface_geo.loc += geometry.loc;
 
                 subregion = Some(TransformedRegion {
                     rects,
-                    scale: surface_anim_scale,
+                    scale: Scale::from(1.),
                     offset: surface_geo.loc,
                 });
 
@@ -250,8 +224,7 @@ fn render_params_for_tile(
         }
     }
 
-    // This corner radius is reset to self.corner_radius in render().
-    let clip = clip.then_some((geometry, CornerRadius::default()));
+    let clip = clip.then_some(geometry);
 
     Some(RenderParams {
         geometry: effect_geometry,
@@ -289,9 +262,7 @@ pub fn render_for_tile(
     clip_to_geometry: bool,
     surface: &WlSurface,
     surface_off: Point<f64, Logical>,
-    surface_anim_scale: Scale<f64>,
     blur_config: niri_config::Blur,
-    radius: CornerRadius,
     effect: niri_config::BackgroundEffect,
     should_block_out: bool,
     xray_pos: XrayPos,
@@ -305,7 +276,7 @@ pub fn render_for_tile(
         let has_blur_region = blur_region.as_ref().is_some_and(|r| !r.is_empty());
 
         background_effect.update_config(blur_config);
-        background_effect.update_render_elements(radius, effect, has_blur_region);
+        background_effect.update_render_elements(effect, has_blur_region);
 
         if !background_effect.is_visible() {
             return;
@@ -321,7 +292,6 @@ pub fn render_for_tile(
             should_block_out,
             blur_region,
             surface_geo,
-            surface_anim_scale,
         ) else {
             return;
         };

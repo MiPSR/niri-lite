@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use anyhow::ensure;
 use niri_config::{
-    Action, Bind, Color, Config, CornerRadius, GradientInterpolation, Key, Modifiers, MruDirection,
-    MruFilter, MruScope, Trigger,
+    Action, Bind, Config, Key, Modifiers, MruDirection, MruFilter, MruScope, Trigger,
 };
 use pango::FontDescription;
 use pangocairo::cairo::{self, ImageSurface};
@@ -23,7 +22,7 @@ use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::animation::{Animation, Clock};
+use crate::clock::Clock;
 use crate::layout::focus_ring::{FocusRing, FocusRingRenderElement};
 use crate::layout::{Layout, LayoutElement as _, LayoutElementRenderElement};
 use crate::niri::Niri;
@@ -31,7 +30,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
-use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+use crate::render_helpers::offscreen::OffscreenRenderElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -126,12 +125,9 @@ niri_render_elements! {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum UiState {
     Open(Inner),
-    Closing {
-        inner: Inner,
-        anim: Animation,
-    },
     Closed {
         /// Scope used when the UI was last opened.
         previous_scope: MruScope,
@@ -144,7 +140,7 @@ struct Inner {
     wmru: WindowMru,
 
     /// View position relative to the leftmost visible window.
-    view_pos: ViewPos,
+    view_pos: f64,
 
     // If true, don't automatically move the current thumbnail in-view. Set on pointer motion.
     freeze_view: bool,
@@ -166,23 +162,6 @@ struct Inner {
 
     /// Backdrop buffers for each output.
     backdrop_buffers: RefCell<HashMap<Output, SolidColorBuffer>>,
-
-    /// Offscreen buffer for the closing fade animation on the main output.
-    offscreen: OffscreenBuffer,
-}
-
-#[derive(Debug)]
-enum ViewPos {
-    /// The view position is static.
-    Static(f64),
-    /// The view position is animating.
-    Animation(Animation),
-}
-
-#[derive(Debug)]
-struct MoveAnimation {
-    anim: Animation,
-    from: f64,
 }
 
 type MruTexture = TextureBuffer<GlesTexture>;
@@ -220,17 +199,14 @@ struct Thumbnail {
     /// Cached size of the window.
     size: Size<i32, Logical>,
 
-    clock: Clock,
     config: niri_config::MruPreviews,
-    open_animation: Option<Animation>,
-    move_animation: Option<MoveAnimation>,
     title_texture: RefCell<TitleTexture>,
     background: RefCell<FocusRing>,
     border: RefCell<FocusRing>,
 }
 
 impl Thumbnail {
-    fn from_mapped(mapped: &Mapped, clock: Clock, config: niri_config::MruPreviews) -> Self {
+    fn from_mapped(mapped: &Mapped, config: niri_config::MruPreviews) -> Self {
         let app_id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
 
         let background = FocusRing::new(niri_config::FocusRing {
@@ -252,50 +228,11 @@ impl Thumbnail {
             on_current_workspace: false,
             app_id,
             size: mapped.size(),
-            clock,
             config,
-            open_animation: None,
-            move_animation: None,
             title_texture: Default::default(),
             background: RefCell::new(background),
             border: RefCell::new(border),
         }
-    }
-
-    fn are_animations_ongoing(&self) -> bool {
-        self.open_animation.is_some() || self.move_animation.is_some()
-    }
-
-    fn advance_animations(&mut self) {
-        self.open_animation.take_if(|a| a.is_done());
-        self.move_animation.take_if(|a| a.anim.is_done());
-    }
-
-    /// Animate thumbnail motion from given location.
-    fn animate_move_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
-        let current_offset = self.render_offset();
-
-        // Preserve the previous config if ongoing.
-        let anim = self.move_animation.take().map(|ma| ma.anim);
-        let anim = anim
-            .map(|anim| anim.restarted(1., 0., 0.))
-            .unwrap_or_else(|| Animation::new(self.clock.clone(), 1., 0., 0., config));
-
-        self.move_animation = Some(MoveAnimation {
-            anim,
-            from: from + current_offset,
-        });
-    }
-
-    fn animate_open_with_config(&mut self, config: niri_config::Animation) {
-        self.open_animation = Some(Animation::new(self.clock.clone(), 0., 1., 0., config));
-    }
-
-    fn render_offset(&self) -> f64 {
-        self.move_animation
-            .as_ref()
-            .map(|ma| ma.from * ma.anim.value())
-            .unwrap_or_default()
     }
 
     fn update_window(&mut self, mapped: &Mapped) {
@@ -355,12 +292,6 @@ impl Thumbnail {
 
         let s = Scale::from(scale);
 
-        let preview_alpha = self
-            .open_animation
-            .as_ref()
-            .map_or(1., |a| a.clamped_value() as f32)
-            .clamp(0., 1.);
-
         let bob_y = if mapped.rules().baba_is_float == Some(true) {
             bob_y
         } else {
@@ -369,22 +300,15 @@ impl Thumbnail {
         let bob_offset = Point::new(0., bob_y);
 
         // Clip thumbnails to their geometry.
-        let radius = if mapped.sizing_mode().is_normal() {
-            mapped.geometry_corner_radius()
-        } else {
-            CornerRadius::default()
-        };
-
-        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
         let geo = Rectangle::from_size(self.size.to_f64());
         // FIXME: deduplicate code with Tile::render_inner()
         let clip = move |elem| match elem {
             LayoutElementRenderElement::Wayland(elem) => {
                 if let Some(shader) = clip_shader.clone() {
-                    if ClippedSurfaceRenderElement::will_clip(&elem, s, geo, radius) {
+                    if ClippedSurfaceRenderElement::will_clip(&elem, s, geo) {
                         let elem =
-                            ClippedSurfaceRenderElement::new(elem, s, geo, shader.clone(), radius);
+                            ClippedSurfaceRenderElement::new(elem, s, geo, shader.clone());
                         return ThumbnailRenderElement::ClippedSurface(elem);
                     }
                 }
@@ -394,30 +318,7 @@ impl Thumbnail {
                 ThumbnailRenderElement::LayoutElement(elem)
             }
             LayoutElementRenderElement::SolidColor(elem) => {
-                // In this branch we're rendering a blocked-out window with a solid
-                // color. We need to render it with a rounded corner shader even if
-                // clip_to_geometry is false, because in this case we're assuming that
-                // the unclipped window CSD already has corners rounded to the
-                // user-provided radius, so our blocked-out rendering should match that
-                // radius.
-                if radius != CornerRadius::default() && has_border_shader {
-                    return BorderRenderElement::new(
-                        geo.size,
-                        Rectangle::from_size(geo.size),
-                        GradientInterpolation::default(),
-                        Color::from_color32f(elem.color()),
-                        Color::from_color32f(elem.color()),
-                        0.,
-                        Rectangle::from_size(geo.size),
-                        0.,
-                        radius,
-                        scale as f32,
-                        1.,
-                    )
-                    .into();
-                }
-
-                // Otherwise, render the solid color as is.
+                // Render the solid color as is.
                 LayoutElementRenderElement::SolidColor(elem).into()
             }
             elem @ LayoutElementRenderElement::BackgroundEffect(_) => {
@@ -448,7 +349,7 @@ impl Thumbnail {
         };
 
         // FIXME: this could use mipmaps, for that it should be rendered through an offscreen.
-        mapped.render_normal(ctx.r(), Point::new(0., 0.), s, preview_alpha, &mut |elem| {
+        mapped.render_normal(ctx.r(), Point::new(0., 0.), s, 1., &mut |elem| {
             let elem = clip(elem);
             let elem = downscale(elem);
             push(elem)
@@ -482,7 +383,7 @@ impl Thumbnail {
             let texture = TextureRenderElement::from_texture_buffer(
                 texture,
                 loc,
-                preview_alpha,
+                1.,
                 Some(src),
                 None,
                 Kind::Unspecified,
@@ -521,8 +422,6 @@ impl Thumbnail {
                 color *= 0.4;
             }
 
-            let radius = CornerRadius::from(config.highlight.corner_radius as f32);
-
             let loc = preview_geo.loc - padding;
 
             let mut background = self.background.borrow_mut();
@@ -535,7 +434,6 @@ impl Thumbnail {
                 false,
                 false,
                 Rectangle::default(),
-                radius,
                 scale,
                 0.5,
             );
@@ -549,14 +447,12 @@ impl Thumbnail {
             config.width = round(BORDER);
             config.active_color = color;
             border.update_config(config);
-            border.set_thicken_corners(false);
             border.update_render_elements(
                 size,
                 true,
                 true,
                 false,
                 Rectangle::default(),
-                radius.expanded_by(config.width as f32),
                 scale,
                 1.,
             );
@@ -587,7 +483,7 @@ impl WindowMru {
             let on_current_workspace = on_current_output && mon.active_workspace_idx() == ws_idx;
 
             for mapped in ws.windows() {
-                let mut thumbnail = Thumbnail::from_mapped(mapped, niri.clock.clone(), config);
+                let mut thumbnail = Thumbnail::from_mapped(mapped, config);
                 thumbnail.on_current_output = on_current_output;
                 thumbnail.on_current_workspace = on_current_workspace;
                 thumbnails.push(thumbnail);
@@ -630,27 +526,12 @@ impl WindowMru {
         self.thumbnails.iter().filter(move |t| matches(t))
     }
 
-    fn thumbnails_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Thumbnail> {
-        let matches = match_filter(self.scope, self.app_id_filter.as_deref());
-        self.thumbnails.iter_mut().filter(move |t| matches(t))
-    }
-
     fn thumbnails_with_idx(&self) -> impl DoubleEndedIterator<Item = (usize, &Thumbnail)> {
         let matches = match_filter(self.scope, self.app_id_filter.as_deref());
         self.thumbnails
             .iter()
             .enumerate()
             .filter(move |(_, t)| matches(t))
-    }
-
-    fn are_animations_ongoing(&self) -> bool {
-        self.thumbnails.iter().any(|t| t.are_animations_ongoing())
-    }
-
-    fn advance_animations(&mut self) {
-        for thumbnail in &mut self.thumbnails {
-            thumbnail.advance_animations();
-        }
     }
 
     fn forward(&mut self) {
@@ -844,55 +725,6 @@ fn match_filter(scope: MruScope, app_id_filter: Option<&str>) -> impl Fn(&Thumbn
     move |thumbnail| matches(scope, app_id_filter, thumbnail)
 }
 
-impl ViewPos {
-    fn current(&self) -> f64 {
-        match self {
-            ViewPos::Static(pos) => *pos,
-            ViewPos::Animation(anim) => anim.value(),
-        }
-    }
-
-    fn target(&self) -> f64 {
-        match self {
-            ViewPos::Static(pos) => *pos,
-            ViewPos::Animation(anim) => anim.to(),
-        }
-    }
-
-    fn are_animations_ongoing(&self) -> bool {
-        match self {
-            ViewPos::Static(_) => false,
-            ViewPos::Animation(_) => true,
-        }
-    }
-
-    fn advance_animations(&mut self) {
-        if let ViewPos::Animation(anim) = self {
-            if anim.is_done() {
-                *self = ViewPos::Static(anim.to());
-            }
-        }
-    }
-
-    fn animate_from_with_config(
-        &mut self,
-        from: f64,
-        config: niri_config::Animation,
-        clock: Clock,
-    ) {
-        // FIXME: also compute and use current velocity.
-        let anim = Animation::new(clock, self.current() + from, self.target(), 0., config);
-        *self = ViewPos::Animation(anim);
-    }
-
-    fn offset(&mut self, delta: f64) {
-        match self {
-            ViewPos::Static(pos) => *pos += delta,
-            ViewPos::Animation(anim) => anim.offset(delta),
-        }
-    }
-}
-
 impl WindowMruUi {
     pub fn new(config: Rc<RefCell<Config>>) -> Self {
         let mut rv = Self {
@@ -914,7 +746,6 @@ impl WindowMruUi {
     pub fn update_config(&mut self) {
         let inner = match &mut self.state {
             UiState::Open(inner) => inner,
-            UiState::Closing { inner, .. } => inner,
             UiState::Closed { .. } => return,
         };
         inner.update_config();
@@ -934,7 +765,7 @@ impl WindowMruUi {
 
         let mut inner = Inner {
             wmru,
-            view_pos: ViewPos::Static(0.),
+            view_pos: 0.,
             freeze_view: false,
             open_at: clock.now_unadjusted() + open_delay,
             clock,
@@ -942,9 +773,8 @@ impl WindowMruUi {
             output,
             scope_panel: Default::default(),
             backdrop_buffers: Default::default(),
-            offscreen: OffscreenBuffer::default(),
         };
-        inner.view_pos = ViewPos::Static(inner.compute_view_pos());
+        inner.view_pos = inner.compute_view_pos();
 
         self.state = UiState::Open(inner);
     }
@@ -968,20 +798,11 @@ impl WindowMruUi {
             MruCloseRequest::Confirm => inner.wmru.current_id,
         };
 
-        if !inner.is_fully_open() {
-            // Hasn't displayed yet, no need to fade out.
-            let UiState::Closed { previous_scope } = &mut self.state else {
-                unreachable!()
-            };
-            *previous_scope = inner.wmru.scope;
-            return response;
-        }
+        let UiState::Closed { previous_scope } = &mut self.state else {
+            unreachable!()
+        };
+        *previous_scope = inner.wmru.scope;
 
-        let config = self.config.borrow();
-        let config = config.animations.recent_windows_close.0;
-
-        let anim = Animation::new(inner.clock.clone(), 1., 0., 0., config);
-        self.state = UiState::Closing { inner, anim };
         response
     }
 
@@ -1061,7 +882,7 @@ impl WindowMruUi {
     pub fn scope(&self) -> MruScope {
         match &self.state {
             UiState::Closed { previous_scope, .. } => *previous_scope,
-            UiState::Open(inner) | UiState::Closing { inner, .. } => inner.wmru.scope,
+            UiState::Open(inner) => inner.wmru.scope,
         }
     }
 
@@ -1097,110 +918,45 @@ impl WindowMruUi {
         &self,
         niri: &Niri,
         output: &Output,
-        mut ctx: RenderCtx<R>,
+        ctx: RenderCtx<R>,
         push: &mut dyn FnMut(WindowMruUiRenderElement<R>),
     ) {
-        let (inner, progress) = match &self.state {
-            UiState::Closed { .. } => return,
-            UiState::Closing { inner, anim } => (inner, anim.clamped_value()),
-            UiState::Open(inner) => {
-                if inner.is_fully_open() {
-                    (inner, 1.)
-                } else {
-                    return;
-                }
-            }
+        let UiState::Open(inner) = &self.state else {
+            return;
         };
 
-        let _span = tracy_client::span!("WindowMruUi::render_output");
+        // Don't render until the UI is visible.
+        if !inner.is_fully_open() {
+            return;
+        }
 
-        let alpha = progress.clamp(0., 1.) as f32;
+        let _span = tracy_client::span!("WindowMruUi::render_output");
 
         // Put a backdrop above the current desktop view to contrast the thumbnails.
         let mut buffers = inner.backdrop_buffers.borrow_mut();
         let buffer = buffers.entry(output.clone()).or_default();
         buffer.resize(output_size(output));
         buffer.set_color(BACKDROP_COLOR);
-        let render_backdrop = |alpha| {
-            SolidColorRenderElement::from_buffer(
-                buffer,
-                Point::new(0., 0.),
-                alpha,
-                Kind::Unspecified,
-            )
-            // Can't wrap into WindowMruUiRenderElement::SolidColor() right here since we have
-            // different <R> generic in offscreen vs. normal path.
-        };
 
-        // During the closing fade, use an offscreen to avoid transparent compositing artifacts.
-        let mut pushed_offscreen = false;
-        if *output == inner.output && alpha < 1. {
-            let mut ctx = ctx.as_gles();
-
-            let mut elems = Vec::new();
-            inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
-            elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
-
-            let scale = output.current_scale().fractional_scale();
-            match inner
-                .offscreen
-                .render(ctx.renderer, Scale::from(scale), &elems)
-            {
-                Ok((elem, _sync, _data)) => {
-                    // FIXME: would be good to passthrough offscreen data to visible windows here.
-                    // As is, during the closing fade, windows from other workspaces stop receiving
-                    // frame callbacks.
-                    //
-                    // However, we need to refactor our offscreen data a bit to make this nicer.
-                    // Currently it supports a stack of offscreens, but not a several unrelated
-                    // offscreens showing the same window (possibly in addition to the window
-                    // itself).
-                    //
-                    // Anyhow, this is not very noticeable since Alt-Tab closing happens quickly.
-                    push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
-                    pushed_offscreen = true;
-                }
-                Err(err) => {
-                    warn!("error rendering MRU to offscreen for fade-out: {err:?}");
-                }
-            }
-        }
-
-        // When alpha is 1., render everything directly, without an offscreen.
-        //
-        // This is not used as fallback when offscreen fails to render because it looks better to
-        // hide the previews immediately than to render them with alpha = 1. during a fade-out.
-        if *output == inner.output && alpha == 1. {
+        if *output == inner.output {
             inner.render(niri, ctx, &mut |elem| push(elem));
         }
 
-        // This is used for both normal elems and for other outputs.
-        if !pushed_offscreen {
-            push(WindowMruUiRenderElement::SolidColor(render_backdrop(alpha)));
-        }
+        push(WindowMruUiRenderElement::SolidColor(
+            SolidColorRenderElement::from_buffer(buffer, Point::new(0., 0.), 1., Kind::Unspecified),
+        ));
     }
 
-    pub fn are_animations_ongoing(&self) -> bool {
+    pub fn needs_update(&self) -> bool {
         match &self.state {
-            UiState::Open(inner) => inner.are_animations_ongoing(),
-            UiState::Closing { .. } => true,
+            UiState::Open(inner) => inner.needs_update(),
             UiState::Closed { .. } => false,
         }
     }
 
-    pub fn advance_animations(&mut self) {
-        match &mut self.state {
-            UiState::Open(inner) => inner.advance_animations(),
-            UiState::Closing { inner, anim } => {
-                if anim.is_done() {
-                    self.state = UiState::Closed {
-                        previous_scope: inner.wmru.scope,
-                    };
-                    return;
-                }
-                inner.advance_animations();
-            }
-            UiState::Closed { .. } => {}
+    pub fn update(&mut self) {
+        if let UiState::Open(inner) = &mut self.state {
+            inner.update();
         }
     }
 
@@ -1265,35 +1021,20 @@ impl Inner {
         }
     }
 
-    fn are_animations_ongoing(&self) -> bool {
+    fn needs_update(&self) -> bool {
         self.clock.now_unadjusted() < self.open_at
-            || self.view_pos.are_animations_ongoing()
-            || self.wmru.are_animations_ongoing()
     }
 
-    fn advance_animations(&mut self) {
-        self.view_pos.advance_animations();
-        self.wmru.advance_animations();
-
+    fn update(&mut self) {
         if !self.freeze_view {
             let new_view_pos = self.compute_view_pos();
-            let delta = new_view_pos - self.view_pos.target();
-            let pixel = 1. / self.output.current_scale().fractional_scale();
-            if delta.abs() > pixel {
-                self.animate_view_pos_from(-delta);
-            }
-            self.view_pos.offset(delta);
+            let delta = new_view_pos - self.view_pos;
+            self.view_pos += delta;
         }
     }
 
     fn is_fully_open(&self) -> bool {
         self.open_at <= self.clock.now_unadjusted()
-    }
-
-    fn animate_view_pos_from(&mut self, from: f64) {
-        let config = self.config.borrow().animations.window_movement.0;
-        self.view_pos
-            .animate_from_with_config(from, config, self.clock.clone());
     }
 
     fn compute_view_pos(&self) -> f64 {
@@ -1327,7 +1068,7 @@ impl Inner {
         }
 
         compute_view_offset(
-            self.view_pos.target() + working_x,
+            self.view_pos + working_x,
             working_width,
             current_geo.loc.x,
             current_geo.size.w,
@@ -1358,7 +1099,7 @@ impl Inner {
         if let Some(prev) = prev_size {
             let new = thumbnail.preview_size(output_size, scale);
             let delta = new.w - prev.w;
-            self.view_pos.offset(delta);
+            self.view_pos += delta;
         }
     }
 
@@ -1368,10 +1109,11 @@ impl Inner {
         let last_visible = self.wmru.thumbnails().next_back();
         let removing_last_visible = last_visible.is_some_and(|t| t.id == id);
 
-        // When removing the last visible thumbnail, nothing needs to be animated.
+        // When removing the last visible thumbnail, the view position doesn't need to be
+        // compensated.
         // - If it's not currently selected, then it can't cause changes to view position.
         // - If it's currently selected, then the first step in removal (focusing the next window)
-        //   will wrap back to the start, and no animations should happen.
+        //   will wrap back to the start.
         if !removing_last_visible {
             let output_size = output_size(&self.output);
             let scale = self.output.current_scale().fractional_scale();
@@ -1384,22 +1126,10 @@ impl Inner {
             let prev_size = self.wmru.thumbnails[idx].preview_size(output_size, scale);
             let delta = prev_size.w + gap;
 
-            let config = self.config.borrow().animations.window_movement.0;
-
             // If the removed window is to the left of the currently selected one, we need to offset
             // the view position to compensate for the change.
             if self.wmru.thumbnail_left_of_current(id).is_some() {
-                self.view_pos.offset(-delta);
-
-                // And animate movement of windows left of it.
-                for thumbnail in self.wmru.thumbnails_mut().take_while(|t| t.id != id) {
-                    thumbnail.animate_move_from_with_config(-delta, config);
-                }
-            } else {
-                // Otherwise, animate movement of windows right of it.
-                for thumbnail in self.wmru.thumbnails_mut().rev().take_while(|t| t.id != id) {
-                    thumbnail.animate_move_from_with_config(delta, config);
-                }
+                self.view_pos -= delta;
             }
         }
 
@@ -1407,80 +1137,15 @@ impl Inner {
     }
 
     fn set_scope(&mut self, scope: MruScope) {
-        let was_empty = self.wmru.current_id.is_none();
-        if let Some(old_scope) = self.wmru.set_scope(scope) {
-            self.animate_scope_filter_change(was_empty, old_scope, None);
+        if self.wmru.set_scope(scope).is_some() {
+            self.view_pos = self.compute_view_pos();
         }
     }
 
     fn set_filter(&mut self, filter: MruFilter) {
-        let was_empty = self.wmru.current_id.is_none();
-        if let Some(old_filter) = self.wmru.set_filter(filter) {
-            let old_filter = Some(old_filter.as_deref());
-            self.animate_scope_filter_change(was_empty, self.wmru.scope, old_filter);
+        if self.wmru.set_filter(filter).is_some() {
+            self.view_pos = self.compute_view_pos();
         }
-    }
-
-    fn animate_scope_filter_change(
-        &mut self,
-        was_empty: bool,
-        old_scope: MruScope,
-        old_filter: Option<Option<&str>>,
-    ) {
-        let Some(id) = self.wmru.current_id else {
-            // If there's no current_id then the new filter caused all windows to disappear, so
-            // there's nothing to animate.
-            return;
-        };
-        let idx = self.wmru.idx_of(id).unwrap();
-
-        // Animate opening for newly appeared thumbnails.
-        let config = self.config.borrow().animations.window_open.anim;
-        let old_filter = old_filter.unwrap_or(self.wmru.app_id_filter.as_deref());
-        let matches_old = match_filter(old_scope, old_filter);
-        let matches_new = match_filter(self.wmru.scope, self.wmru.app_id_filter.as_deref());
-        for thumbnail in &mut self.wmru.thumbnails {
-            if matches_new(thumbnail) && !matches_old(thumbnail) {
-                thumbnail.animate_open_with_config(config);
-            }
-        }
-
-        if was_empty {
-            self.view_pos = ViewPos::Static(self.compute_view_pos());
-            return;
-        }
-
-        let output_size = output_size(&self.output);
-        let scale = self.output.current_scale().fractional_scale();
-        let round = move |logical: f64| round_logical_in_physical(scale, logical);
-
-        let padding = self.config.borrow().recent_windows.highlight.padding;
-        let padding = round(padding) + round(BORDER);
-        let gap = padding + round(GAP) + padding;
-
-        let config = self.config.borrow().animations.window_movement.0;
-
-        let mut delta = 0.;
-        for t in &mut self.wmru.thumbnails[idx + 1..] {
-            match (matches_old(t), matches_new(t)) {
-                (true, true) => t.animate_move_from_with_config(delta, config),
-                (true, false) => delta += t.preview_size(output_size, scale).w + gap,
-                (false, true) => delta -= t.preview_size(output_size, scale).w + gap,
-                (false, false) => (),
-            }
-        }
-
-        let mut delta = 0.;
-        for t in self.wmru.thumbnails[..idx].iter_mut().rev() {
-            match (matches_old(t), matches_new(t)) {
-                (true, true) => t.animate_move_from_with_config(-delta, config),
-                (true, false) => delta += t.preview_size(output_size, scale).w + gap,
-                (false, true) => delta -= t.preview_size(output_size, scale).w + gap,
-                (false, false) => (),
-            }
-        }
-
-        self.view_pos.offset(-delta);
     }
 
     fn thumbnails(&self) -> impl Iterator<Item = (&Thumbnail, Rectangle<f64, Logical>)> {
@@ -1512,7 +1177,7 @@ impl Inner {
         let scale = self.output.current_scale().fractional_scale();
         let round = |logical: f64| round_logical_in_physical(scale, logical);
 
-        let view_pos = round(self.view_pos.current());
+        let view_pos = round(self.view_pos);
 
         let leftmost = view_pos;
         let rightmost = view_pos + output_size.w;
@@ -1536,11 +1201,10 @@ impl Inner {
         let scale = self.output.current_scale().fractional_scale();
         let round = move |logical: f64| round_logical_in_physical(scale, logical);
 
-        let view_pos = round(self.view_pos.current());
+        let view_pos = round(self.view_pos);
 
         self.thumbnails().filter_map(move |(thumbnail, mut geo)| {
             geo.loc.x -= view_pos;
-            geo.loc.x += round(thumbnail.render_offset());
 
             if geo.loc.x + geo.size.w < 0. || output_size.w < geo.loc.x {
                 return None;

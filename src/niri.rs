@@ -116,7 +116,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
-use crate::animation::Clock;
+use crate::clock::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
@@ -163,7 +163,7 @@ use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
-    render_to_texture, render_to_vec, shaders, RenderCtx, RenderTarget,
+    render_to_texture, render_to_vec, RenderCtx, RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -766,7 +766,7 @@ impl State {
         // in order to clear completed animations and render elements. Even if we're not rendering,
         // it's good to advance every now and then so the workspace clean-up and animations don't
         // build up (the 1 second frame callback timer will call this line).
-        self.niri.advance_animations();
+        self.niri.update();
 
         self.niri.redraw_queued_outputs(&mut self.backend);
 
@@ -1050,7 +1050,7 @@ impl State {
             // Don't refresh cursor focus during transitions.
             if let Some((output, _)) = self.niri.output_under(location) {
                 let monitor = self.niri.layout.monitor_for_output(output).unwrap();
-                if monitor.are_transitions_ongoing() {
+                if monitor.has_workspace_switch() {
                     return;
                 }
             }
@@ -1475,12 +1475,7 @@ impl State {
             self.niri.layout.ensure_named_workspace(ws_config);
         }
 
-        let rate = 1.0 / config.animations.slowdown.max(0.001);
-        self.niri.clock.set_rate(rate);
-        self.niri
-            .clock
-            .set_complete_instantly(config.animations.off);
-
+        *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
         *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
         let mut reload_xkb = None;
@@ -1489,7 +1484,6 @@ impl State {
         let mut preserved_output_config = None;
         let mut window_rules_changed = false;
         let mut layer_rules_changed = false;
-        let mut shaders_changed = false;
         let mut cursor_inactivity_timeout_changed = false;
         let mut recent_windows_changed = false;
         let mut xwls_changed = false;
@@ -1563,36 +1557,6 @@ impl State {
 
         if config.layer_rules != old_config.layer_rules {
             layer_rules_changed = true;
-        }
-
-        if config.animations.window_resize.custom_shader
-            != old_config.animations.window_resize.custom_shader
-        {
-            let src = config.animations.window_resize.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_resize_program(renderer, src);
-            });
-            shaders_changed = true;
-        }
-
-        if config.animations.window_close.custom_shader
-            != old_config.animations.window_close.custom_shader
-        {
-            let src = config.animations.window_close.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_close_program(renderer, src);
-            });
-            shaders_changed = true;
-        }
-
-        if config.animations.window_open.custom_shader
-            != old_config.animations.window_open.custom_shader
-        {
-            let src = config.animations.window_open.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_open_program(renderer, src);
-            });
-            shaders_changed = true;
         }
 
         if config.cursor.hide_after_inactive_ms != old_config.cursor.hide_after_inactive_ms {
@@ -1683,10 +1647,6 @@ impl State {
 
         if layer_rules_changed {
             self.niri.recompute_layer_rules();
-        }
-
-        if shaders_changed {
-            self.niri.update_shaders();
         }
 
         if cursor_inactivity_timeout_changed {
@@ -2072,51 +2032,6 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
-        // The unmapping tile may have an xray background, in which case we will render xray
-        // elements, so they need to be updated.
-        self.niri.update_xray_render_elements(output);
-
-        self.backend.with_primary_renderer(|renderer| {
-            if let Some(output) = output {
-                let mut ctx = RenderCtx {
-                    target: RenderTarget::Output,
-                    renderer,
-                    xray: None,
-                };
-
-                self.niri.fill_xray_elements(ctx.r(), output);
-
-                // If any background layer has block_out_from, also fill the Screencast xray
-                // buffer so the unmap snapshot can render a buffer with blocked-out background.
-                //
-                // This will be used in Tile::render_snapshot().
-                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
-                if has_blocked_out {
-                    let screencast_ctx = RenderCtx {
-                        target: RenderTarget::Screencast,
-                        ..ctx.r()
-                    };
-                    self.niri.fill_xray_elements(screencast_ctx, output);
-                }
-
-                let state = self.niri.output_state.get_mut(output).unwrap();
-                self.niri.layout.store_unmap_snapshot(
-                    renderer,
-                    Some(&mut state.xray),
-                    has_blocked_out,
-                    window,
-                );
-
-                self.niri.clear_xray_elements(output);
-            } else {
-                self.niri
-                    .layout
-                    .store_unmap_snapshot(renderer, None, false, window);
-            }
-        });
-    }
-
     #[cfg(not(feature = "xdp-gnome-screencast"))]
     pub fn set_dynamic_cast_target(&mut self, _target: CastTarget) {}
 
@@ -2272,11 +2187,7 @@ impl Niri {
         let config_ = config.borrow();
         let config_file_output_config = config_.outputs.clone();
 
-        let mut animation_clock = Clock::default();
-
-        let rate = 1.0 / config_.animations.slowdown.max(0.001);
-        animation_clock.set_rate(rate);
-        animation_clock.set_complete_instantly(config_.animations.off);
+        let animation_clock = Clock::default();
 
         let layout = Layout::new(animation_clock.clone(), &config_);
 
@@ -2438,7 +2349,7 @@ impl Niri {
         let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
         let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(mod_key, &config_.binds);
 
-        let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
+        let screenshot_ui = ScreenshotUi::new();
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
@@ -2448,7 +2359,7 @@ impl Niri {
             hotkey_overlay.show();
         }
 
-        let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
+        let exit_confirm_dialog = ExitConfirmDialog::new();
 
         #[cfg(feature = "dbus")]
         let a11y = A11y::new(event_loop.clone());
@@ -4083,14 +3994,9 @@ impl Niri {
         }
     }
 
-    pub fn advance_animations(&mut self) {
-        let _span = tracy_client::span!("Niri::advance_animations");
-
-        self.layout.advance_animations();
-        self.config_error_notification.advance_animations();
-        self.exit_confirm_dialog.advance_animations();
-        self.screenshot_ui.advance_animations();
-        self.window_mru_ui.advance_animations();
+    pub fn update(&mut self) {
+        self.layout.update();
+        self.config_error_notification.update();
 
         for state in self.output_state.values_mut() {
             if let Some(transition) = &mut state.screen_transition {
@@ -4629,12 +4535,10 @@ impl Niri {
         let mut res = RenderResult::Skipped;
         if self.monitors_active {
             let state = self.output_state.get_mut(output).unwrap();
-            state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
+            state.unfinished_animations_remain = self.layout.needs_update(Some(output));
             state.unfinished_animations_remain |=
-                self.config_error_notification.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
+                self.config_error_notification.needs_update();
+            state.unfinished_animations_remain |= self.window_mru_ui.needs_update();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.
@@ -4647,7 +4551,7 @@ impl Niri {
                 state.unfinished_animations_remain |= layer_map_for_output(output)
                     .layers()
                     .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
-                    .any(|mapped| mapped.are_animations_ongoing());
+                    .any(|mapped| mapped.needs_update());
             }
 
             // Render.

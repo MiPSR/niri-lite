@@ -72,7 +72,6 @@ pub struct MruHighlight {
     pub active_color: Color,
     pub urgent_color: Color,
     pub padding: f64,
-    pub corner_radius: f64,
 }
 
 impl Default for MruHighlight {
@@ -81,7 +80,6 @@ impl Default for MruHighlight {
             active_color: Color::new_unpremul(0.6, 0.6, 0.6, 1.),
             urgent_color: Color::new_unpremul(1., 0.6, 0.6, 1.),
             padding: 30.,
-            corner_radius: 0.,
         }
     }
 }
@@ -94,14 +92,12 @@ pub struct MruHighlightPart {
     pub urgent_color: Option<Color>,
     #[knuffel(child, unwrap(argument))]
     pub padding: Option<FloatOrInt<0, 65535>>,
-    #[knuffel(child, unwrap(argument))]
-    pub corner_radius: Option<FloatOrInt<0, 65535>>,
 }
 
 impl MergeWith<MruHighlightPart> for MruHighlight {
     fn merge_with(&mut self, part: &MruHighlightPart) {
         merge_clone!((self, part), active_color, urgent_color);
-        merge!((self, part), padding, corner_radius);
+        merge!((self, part), padding);
     }
 }
 

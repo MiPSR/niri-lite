@@ -3,12 +3,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use niri_config::utils::MergeWith as _;
-use niri_config::{
-    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, Workspace as WorkspaceConfig,
-};
+use niri_config::{CenterFocusedColumn, OutputName, PresetSize, Workspace as WorkspaceConfig};
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -22,21 +19,20 @@ use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
 use super::shadow::Shadow;
-use super::tile::{Tile, TileRenderSnapshot};
+use super::tile::Tile;
 use super::{
     ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
     RemovedTile, SizeFrac,
 };
-use crate::animation::Clock;
-use crate::layout::RenderLayer;
+use crate::clock::Clock;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
+use crate::render_helpers::xray::XrayPos;
 use crate::utils::id::IdCounter;
-use crate::utils::transaction::{Transaction, TransactionBlocker};
+use crate::utils::transaction::Transaction;
 use crate::utils::{
     ensure_min_max_size, ensure_min_max_size_maybe_zero, output_size, send_scale_transform,
     ResizeEdge,
@@ -363,39 +359,28 @@ impl<W: LayoutElement> Workspace<W> {
         self.scale
     }
 
-    pub fn advance_animations(&mut self) {
-        self.scrolling.advance_animations();
-        self.floating.advance_animations();
+    pub fn update(&mut self) {
+        self.scrolling.update();
     }
 
-    pub fn are_animations_ongoing(&self) -> bool {
-        self.scrolling.are_animations_ongoing() || self.floating.are_animations_ongoing()
+    pub fn needs_update(&self) -> bool {
+        self.scrolling.needs_update() || self.floating.needs_update()
     }
 
-    pub fn are_transitions_ongoing(&self) -> bool {
-        self.scrolling.are_transitions_ongoing() || self.floating.are_transitions_ongoing()
-    }
-
-    pub fn update_render_elements(&mut self, is_active: bool, layer: RenderLayer) {
+    pub fn update_render_elements(&mut self, is_active: bool) {
         self.scrolling
-            .update_render_elements(is_active && !self.floating_is_active.get(), layer);
+            .update_render_elements(is_active && !self.floating_is_active.get());
 
         let view_rect = Rectangle::from_size(self.view_size);
-        self.floating.update_render_elements(
-            is_active && self.floating_is_active.get(),
-            view_rect,
-            layer,
-        );
+        self.floating
+            .update_render_elements(is_active && self.floating_is_active.get(), view_rect);
 
-        if layer.is_normal() {
-            self.shadow.update_render_elements(
-                self.view_size,
-                true,
-                CornerRadius::default(),
-                self.scale.fractional_scale(),
-                1.,
-            );
-        }
+        self.shadow.update_render_elements(
+            self.view_size,
+            true,
+            self.scale.fractional_scale(),
+            1.,
+        );
     }
 
     pub fn update_config(&mut self, base_options: Rc<Options>) {
@@ -613,14 +598,13 @@ impl<W: LayoutElement> Workspace<W> {
         width: ColumnWidth,
         is_full_width: bool,
         is_floating: bool,
-        anim: Option<niri_config::Animation>,
     ) {
         self.enter_output_for_window(tile.window());
         tile.restore_to_floating = is_floating;
 
         match target {
+            // Don't steal focus from an active fullscreen window.
             WorkspaceAddWindowTarget::Auto => {
-                // Don't steal focus from an active fullscreen window.
                 let activate = activate.map_smart(|| !self.is_active_pending_fullscreen());
 
                 // If the tile is pending maximized or fullscreen, open it in the scrolling layout
@@ -632,8 +616,7 @@ impl<W: LayoutElement> Workspace<W> {
                         self.floating_is_active = FloatingActive::Yes;
                     }
                 } else {
-                    self.scrolling
-                        .add_tile(None, tile, activate, width, is_full_width, anim);
+                    self.scrolling.add_tile(None, tile, activate, width, is_full_width);
 
                     if activate {
                         self.floating_is_active = FloatingActive::No;
@@ -643,7 +626,7 @@ impl<W: LayoutElement> Workspace<W> {
             WorkspaceAddWindowTarget::NewColumnAt(col_idx) => {
                 let activate = activate.map_smart(|| false);
                 self.scrolling
-                    .add_tile(Some(col_idx), tile, activate, width, is_full_width, anim);
+                    .add_tile(Some(col_idx), tile, activate, width, is_full_width);
 
                 if activate {
                     self.floating_is_active = FloatingActive::No;
@@ -683,7 +666,7 @@ impl<W: LayoutElement> Workspace<W> {
                     }
                 } else if floating_has_window {
                     self.scrolling
-                        .add_tile(None, tile, activate, width, is_full_width, anim);
+                        .add_tile(None, tile, activate, width, is_full_width);
 
                     if activate {
                         self.floating_is_active = FloatingActive::No;
@@ -695,7 +678,6 @@ impl<W: LayoutElement> Workspace<W> {
                         activate,
                         width,
                         is_full_width,
-                        anim,
                     );
 
                     if activate {
@@ -722,17 +704,12 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub fn add_column(
-        &mut self,
-        column: Column<W>,
-        activate: bool,
-        anim: Option<niri_config::Animation>,
-    ) {
+    pub fn add_column(&mut self, column: Column<W>, activate: bool) {
         for (tile, _) in column.tiles() {
             self.enter_output_for_window(tile.window());
         }
 
-        self.scrolling.add_column(None, column, activate, anim);
+        self.scrolling.add_column(None, column, activate);
 
         if activate {
             self.floating_is_active = FloatingActive::No;
@@ -1408,14 +1385,12 @@ impl<W: LayoutElement> Workspace<W> {
                 target_is_active,
                 removed.width,
                 removed.is_full_width,
-                None,
             );
             if target_is_active {
                 self.floating_is_active = FloatingActive::No;
             }
         } else {
             let mut removed = self.scrolling.remove_tile(&id, Transaction::new());
-            removed.tile.stop_move_animations();
 
             // Come up with a default floating position close to the tile position.
             let stored_or_default = self.floating.stored_or_default_tile_pos(&removed.tile);
@@ -1438,13 +1413,6 @@ impl<W: LayoutElement> Workspace<W> {
                 self.floating_is_active = FloatingActive::Yes;
             }
         }
-
-        let (tile, new_render_pos) = self
-            .tiles_with_render_positions_mut(false)
-            .find(|(tile, _)| *tile.window().id() == id)
-            .unwrap();
-
-        tile.animate_move_from(render_pos - new_render_pos);
     }
 
     pub fn set_window_floating(&mut self, id: Option<&W::Id>, floating: bool) {
@@ -1632,12 +1600,11 @@ impl<W: LayoutElement> Workspace<W> {
         ctx: RenderCtx<R>,
         xray_pos: XrayPos,
         focus_ring: bool,
-        layer: RenderLayer,
         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
     ) {
         let scrolling_focus_ring = focus_ring && !self.floating_is_active();
         self.scrolling
-            .render(ctx, xray_pos, scrolling_focus_ring, layer, &mut |elem| {
+            .render(ctx, xray_pos, scrolling_focus_ring, &mut |elem| {
                 push(elem.into())
             });
     }
@@ -1647,23 +1614,17 @@ impl<W: LayoutElement> Workspace<W> {
         ctx: RenderCtx<R>,
         xray_pos: XrayPos,
         focus_ring: bool,
-        layer: RenderLayer,
         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
     ) {
-        if !self.is_floating_visible() && layer.is_normal() {
+        if !self.is_floating_visible() {
             return;
         }
 
-        let view_rect = Rectangle::from_size(self.view_size);
         let floating_focus_ring = focus_ring && self.floating_is_active();
-        self.floating.render(
-            ctx,
-            xray_pos,
-            view_rect,
-            floating_focus_ring,
-            layer,
-            &mut |elem| push(elem.into()),
-        );
+        self.floating
+            .render(ctx, xray_pos, floating_focus_ring, &mut |elem| {
+                push(elem.into())
+            });
     }
 
     pub fn render_shadow<R: NiriRenderer>(
@@ -1693,72 +1654,6 @@ impl<W: LayoutElement> Workspace<W> {
             self.floating_is_active,
             FloatingActive::Yes | FloatingActive::NoButRaised
         ) || !self.render_above_top_layer()
-    }
-
-    pub fn store_unmap_snapshot_if_empty(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        xray: Option<&mut Xray>,
-        xray_has_blocked_out_layers: bool,
-        xray_pos: XrayPos,
-        window: &W::Id,
-    ) {
-        let view_size = self.view_size();
-        for (tile, tile_pos) in self.tiles_with_render_positions_mut(false) {
-            if tile.window().id() == window {
-                let view_pos = Point::from((-tile_pos.x, -tile_pos.y));
-                let view_rect = Rectangle::new(view_pos, view_size);
-                tile.update_render_elements(false, view_rect);
-                let xray_pos = xray_pos.offset(tile_pos);
-                tile.store_unmap_snapshot_if_empty(
-                    renderer,
-                    xray,
-                    xray_has_blocked_out_layers,
-                    xray_pos,
-                );
-                return;
-            }
-        }
-    }
-
-    pub fn clear_unmap_snapshot(&mut self, window: &W::Id) {
-        for tile in self.tiles_mut() {
-            if tile.window().id() == window {
-                let _ = tile.take_unmap_snapshot();
-                return;
-            }
-        }
-    }
-
-    pub fn start_close_animation_for_window(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        window: &W::Id,
-        blocker: TransactionBlocker,
-    ) {
-        if self.floating.has_window(window) {
-            self.floating
-                .start_close_animation_for_window(renderer, window, blocker);
-        } else {
-            self.scrolling
-                .start_close_animation_for_window(renderer, window, blocker);
-        }
-    }
-
-    pub fn start_close_animation_for_tile(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        snapshot: TileRenderSnapshot,
-        tile_size: Size<f64, Logical>,
-        tile_pos: Point<f64, Logical>,
-        blocker: TransactionBlocker,
-    ) {
-        self.floating
-            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
-    }
-
-    pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
-        self.scrolling.start_open_animation(id) || self.floating.start_open_animation(id)
     }
 
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
@@ -2046,7 +1941,7 @@ impl<W: LayoutElement> Workspace<W> {
             );
         }
 
-        for (tile, tile_pos, visible) in self.tiles_with_render_positions() {
+        for (tile, tile_pos, _visible) in self.tiles_with_render_positions() {
             if Some(tile.window().id()) != move_win_id {
                 assert_eq!(tile.interactive_move_offset, Point::from((0., 0.)));
             }
@@ -2056,18 +1951,6 @@ impl<W: LayoutElement> Workspace<W> {
             // Tile positions must be rounded to physical pixels.
             assert_abs_diff_eq!(tile_pos.x, rounded_pos.x, epsilon = 1e-5);
             assert_abs_diff_eq!(tile_pos.y, rounded_pos.y, epsilon = 1e-5);
-
-            if let Some(alpha) = &tile.alpha_animation {
-                let anim = &alpha.anim;
-                if visible {
-                    assert_eq!(anim.to(), 1., "visible tiles can animate alpha only to 1");
-                }
-
-                assert!(
-                    !alpha.hold_after_done,
-                    "tiles in the layout cannot have held alpha animation"
-                );
-            }
         }
     }
 }
